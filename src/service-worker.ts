@@ -6,7 +6,9 @@ declare const self: ServiceWorkerGlobalScope;
 
 const CACHE_PREFIX = 'binitidal';
 const CACHE_NAME = `${CACHE_PREFIX}-v${version}`;
-const ASSETS = [...build, ...files, '/offline.html'];
+const ASSETS = [...build, ...files, '/offline.html'].filter(
+	(path) => path !== '/_app/env.js'
+);
 
 self.addEventListener('install', (event) => {
 	self.skipWaiting();
@@ -47,6 +49,11 @@ self.addEventListener('fetch', (event) => {
 
 	// Only handle same-origin requests
 	if (url.origin !== self.location.origin) {
+		return;
+	}
+
+	if (url.pathname === '/_app/env.js') {
+		event.respondWith(fetch(request, { cache: 'no-store' }));
 		return;
 	}
 
