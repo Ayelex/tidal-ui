@@ -35,7 +35,12 @@
 	const SPOTIFY_LIKE_RESOLVE_ATTEMPTS = 5;
 	const SPOTIFY_LIKE_SEARCH_ATTEMPTS = 3;
 	const SPOTIFY_LIKE_FETCH_ATTEMPTS = 4;
+	const SPOTIFY_LIKE_FORCE_SCORE = 35;
 	const SPOTIFY_LIKE_RETRY_DELAYS_MS = [300, 800, 1600, 3000, 4500];
+	const songlinkUserCountry =
+		typeof navigator !== 'undefined'
+			? navigator.language?.split('-')[1]?.toUpperCase()
+			: undefined;
 
 	const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 	const normalizeText = (value: string) =>
@@ -45,12 +50,38 @@
 			.replace(/[^a-z0-9\s]+/gi, '')
 			.toLowerCase()
 			.trim();
+	const stripDecorations = (value: string) =>
+		value
+			.replace(/\s*[\(\[]\s*(feat|ft|featuring|with)\b[^\)\]]*[\)\]]/gi, '')
+			.replace(/\s*-\s*(feat|ft|featuring|with)\b.+$/gi, '')
+			.replace(
+				/\s*-\s*(remaster(?:ed)?|mix|version|edit|live|mono|stereo|deluxe|bonus|explicit|clean|radio|instrumental|acoustic|demo)\b.*$/gi,
+				''
+			)
+			.replace(/\s+/g, ' ')
+			.trim();
 
 	const getTrackArtistLabel = (track: Track): string => {
 		if (track.artists?.length) {
 			return formatArtists(track.artists);
 		}
 		return track.artist?.name ?? '';
+	};
+
+	const buildNormalizedSource = (source: SpotifyTrackMetadata) => {
+		const rawTitle = source.title ?? '';
+		const rawArtist = source.artistName ?? '';
+		const rawAlbum = source.albumName ?? '';
+		const cleanTitle = stripDecorations(rawTitle);
+		const cleanArtist = stripDecorations(rawArtist);
+		const cleanAlbum = stripDecorations(rawAlbum);
+
+		return {
+			targetTitle: normalizeText(cleanTitle || rawTitle),
+			targetArtist: normalizeText(cleanArtist || rawArtist),
+			targetAlbum: normalizeText(cleanAlbum || rawAlbum),
+			targetIsrc: normalizeText(source.isrc ?? '')
+		};
 	};
 
 	const scoreTrackMatch = (
@@ -121,12 +152,33 @@
 		return score;
 	};
 
-	const findBestTrackMatch = (tracks: Track[], source: SpotifyTrackMetadata): Track | null => {
-		const targetTitle = normalizeText(source.title ?? '');
-		const targetArtist = normalizeText(source.artistName ?? '');
-		const targetAlbum = normalizeText(source.albumName ?? '');
-		const targetIsrc = normalizeText(source.isrc ?? '');
-		if (!targetTitle) return null;
+	const tokenOverlap = (sourceValue: string, candidateValue: string) => {
+		if (!sourceValue || !candidateValue) return false;
+		const tokens = sourceValue.split(' ').filter((token) => token.length >= 3);
+		if (tokens.length === 0) return false;
+		const matched = tokens.filter((token) => candidateValue.includes(token));
+		if (tokens.length === 1) return matched.length === 1;
+		return matched.length / tokens.length >= 0.6;
+	};
+
+	const isLikelyTitleMatch = (candidate: Track, targetTitle: string) => {
+		const candidateTitle = normalizeText(candidate.title ?? '');
+		if (!candidateTitle || !targetTitle) return false;
+		if (candidateTitle === targetTitle) return true;
+		if (candidateTitle.includes(targetTitle) || targetTitle.includes(candidateTitle)) {
+			return true;
+		}
+		return tokenOverlap(candidateTitle, targetTitle) || tokenOverlap(targetTitle, candidateTitle);
+	};
+
+	const findBestTrackMatch = (
+		tracks: Track[],
+		source: SpotifyTrackMetadata
+	): { best: Track | null; bestScore: number; targetTitle: string } => {
+		const { targetTitle, targetArtist, targetAlbum, targetIsrc } = buildNormalizedSource(source);
+		if (!targetTitle) {
+			return { best: null, bestScore: 0, targetTitle };
+		}
 		let best: Track | null = null;
 		let bestScore = 0;
 
@@ -145,60 +197,102 @@
 			}
 		}
 
-		return bestScore >= 50 ? best : null;
+		return { best, bestScore, targetTitle };
 	};
 
 	const searchTidalFallback = async (
 		source: SpotifyTrackMetadata
 	): Promise<{ id: number; url: string } | null> => {
-		const queries = new Set<string>();
+		const queries: string[] = [];
+		const seen = new Set<string>();
+		const pushQuery = (value?: string | null) => {
+			if (!value) return;
+			const trimmed = value.trim();
+			if (!trimmed) return;
+			const key = trimmed.toLowerCase();
+			if (seen.has(key)) return;
+			seen.add(key);
+			queries.push(trimmed);
+		};
+
 		const title = source.title?.trim();
 		const artist = source.artistName?.trim();
 		const album = source.albumName?.trim();
 		const isrc = source.isrc?.trim();
+		const cleanTitle = title ? stripDecorations(title) : undefined;
+		const cleanArtist = artist ? stripDecorations(artist) : undefined;
+		const cleanAlbum = album ? stripDecorations(album) : undefined;
 
 		if (isrc) {
-			queries.add(isrc);
-			queries.add(`isrc:${isrc}`);
-		}
-		if (title && artist) {
-			queries.add(`${title} ${artist}`);
+			pushQuery(isrc);
+			pushQuery(`isrc:${isrc}`);
 		}
 		if (title && artist && album) {
-			queries.add(`${title} ${artist} ${album}`);
+			pushQuery(`${title} ${artist} ${album}`);
+		}
+		if (title && artist) {
+			pushQuery(`${title} ${artist}`);
 		}
 		if (title && album) {
-			queries.add(`${title} ${album}`);
+			pushQuery(`${title} ${album}`);
+		}
+		if (cleanTitle && cleanArtist && cleanAlbum) {
+			pushQuery(`${cleanTitle} ${cleanArtist} ${cleanAlbum}`);
+		}
+		if (cleanTitle && cleanArtist) {
+			pushQuery(`${cleanTitle} ${cleanArtist}`);
+		}
+		if (cleanTitle && cleanAlbum) {
+			pushQuery(`${cleanTitle} ${cleanAlbum}`);
+		}
+		if (cleanTitle) {
+			pushQuery(cleanTitle);
+		}
+		if (title) {
+			pushQuery(title);
 		}
 
-		for (const query of queries) {
-			for (let attempt = 1; attempt <= SPOTIFY_LIKE_SEARCH_ATTEMPTS; attempt += 1) {
-				try {
-					const response = await losslessAPI.searchTracks(query);
-					const items = response?.items ?? [];
-					const best = findBestTrackMatch(items, source);
-					if (best?.id && Number.isFinite(best.id)) {
-						return {
-							id: best.id,
-							url: `https://tidal.com/browse/track/${best.id}`
-						};
+		const runQueries = async (minScore: number, allowLoose: boolean) => {
+			for (const query of queries) {
+				for (let attempt = 1; attempt <= SPOTIFY_LIKE_SEARCH_ATTEMPTS; attempt += 1) {
+					try {
+						const response = await losslessAPI.searchTracks(query);
+						const items = response?.items ?? [];
+						const { best, bestScore, targetTitle } = findBestTrackMatch(items, source);
+						if (best?.id && Number.isFinite(best.id)) {
+							if (bestScore >= minScore) {
+								return {
+									id: best.id,
+									url: `https://tidal.com/browse/track/${best.id}`
+								};
+							}
+							if (allowLoose && isLikelyTitleMatch(best, targetTitle)) {
+								return {
+									id: best.id,
+									url: `https://tidal.com/browse/track/${best.id}`
+								};
+							}
+						}
+					} catch (error) {
+						if (attempt === SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
+							console.warn('Tidal search fallback failed', error);
+						}
 					}
-				} catch (error) {
-					if (attempt === SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
-						console.warn('Tidal search fallback failed', error);
+					if (attempt < SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
+						const delayMs =
+							SPOTIFY_LIKE_RETRY_DELAYS_MS[
+								Math.min(attempt - 1, SPOTIFY_LIKE_RETRY_DELAYS_MS.length - 1)
+							];
+						await wait(delayMs);
 					}
-				}
-				if (attempt < SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
-					const delayMs =
-						SPOTIFY_LIKE_RETRY_DELAYS_MS[
-							Math.min(attempt - 1, SPOTIFY_LIKE_RETRY_DELAYS_MS.length - 1)
-						];
-					await wait(delayMs);
 				}
 			}
-		}
+			return null;
+		};
 
-		return null;
+		const strictMatch = await runQueries(50, false);
+		if (strictMatch) return strictMatch;
+		return runQueries(SPOTIFY_LIKE_FORCE_SCORE, true);
 	};
 
 	function toggleCustomOpen(id: string) {
@@ -342,7 +436,7 @@
 	}) {
 		const spotifyUrl = `https://open.spotify.com/track/${entry.track.spotifyId}`;
 		const songlinkData = await fetchSonglinkData(spotifyUrl, {
-			userCountry: 'US',
+			userCountry: songlinkUserCountry,
 			songIfSingle: true
 		});
 		const tidalInfo = extractTidalInfo(songlinkData);
@@ -546,7 +640,7 @@
 				for (let attempt = 1; attempt <= SPOTIFY_LIKE_RESOLVE_ATTEMPTS; attempt += 1) {
 					try {
 						const songlinkData = await fetchSonglinkData(spotifyUrl, {
-							userCountry: 'US',
+							userCountry: songlinkUserCountry,
 							songIfSingle: true
 						});
 						const tidalInfo = extractTidalInfo(songlinkData);

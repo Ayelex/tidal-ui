@@ -94,7 +94,7 @@ export function extractTidalInfo(response: SonglinkResponse): TidalInfo | null {
 
 	// Parse TIDAL URL to extract type and ID
 	const url = tidalLink.url;
-	const match = url.match(/tidal\.com\/(?:browse\/)?(\w+)\/(\d+)/);
+	const match = url.match(/(?:listen\.|www\.)?tidal\.com\/(?:browse\/)?(\w+)\/(\d+)/);
 
 	if (!match) {
 		return null;
