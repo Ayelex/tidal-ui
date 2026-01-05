@@ -24,13 +24,19 @@
 		Artist,
 		Playlist,
 		AudioQuality,
-		SonglinkTrack,
 		PlayableTrack,
-		SpotifyTrackMetadata
+		SpotifyTrackMetadata,
+		SpotifyPlaylist
 	} from '$lib/types';
 	import { isSonglinkTrack } from '$lib/types';
 	import { libraryStore } from '$lib/stores/library';
 	import { prefetchStreamUrls } from '$lib/utils/streamPrefetch';
+	import {
+		buildSpotifySonglinkTracks,
+		fetchTrackWithRetry,
+		resolveSpotifyMetadataToTidal,
+		resolveUserCountry
+	} from '$lib/utils/trackResolution';
 	import {
 		Search,
 		ChevronDown,
@@ -62,7 +68,7 @@
 	import { searchStore } from '$lib/stores/searchStore.svelte';
 
 	function getLongLink(type: 'track' | 'album' | 'artist' | 'playlist', id: string | number) {
-		return `https://music.binimum.org/${type}/${id}`;
+		return `https://riptify.uk/${type}/${id}`;
 	}
 
 	function getShortLink(type: 'track' | 'album' | 'artist' | 'playlist', id: string | number) {
@@ -72,12 +78,12 @@
 			artist: 'ar',
 			playlist: 'p'
 		};
-		return `https://okiw.me/${prefixMap[type]}/${id}`;
+		return `https://riptify.uk/${prefixMap[type]}/${id}`;
 	}
 
 	function getEmbedCode(type: 'track' | 'album' | 'artist' | 'playlist', id: string | number) {
-		if (type === "track") return `<iframe src="https://music.binimum.org/embed/${type}/${id}" width="100%" height="150" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
-		return `<iframe src="https://music.binimum.org/embed/${type}/${id}" width="100%" height="450" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
+		if (type === "track") return `<iframe src="https://riptify.uk/embed/${type}/${id}" width="100%" height="150" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
+		return `<iframe src="https://riptify.uk/embed/${type}/${id}" width="100%" height="450" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
 	}
 
 	async function copyToClipboard(text: string) {
@@ -111,6 +117,17 @@
 	let downloadTaskIds = $state(new Map<number | string, string>());
 	let cancelledIds = $state(new Set<number | string>());
 	let activeMenuId = $state<number | string | null>(null);
+	let likingConverted = $state(false);
+	let likingProgress = $state<{ done: number; total: number } | null>(null);
+	let likingDone = $state(false);
+	let likingDoneTimeout: ReturnType<typeof setTimeout> | null = null;
+
+	const SPOTIFY_BACKGROUND_BATCH = 120;
+	const SPOTIFY_BACKGROUND_DELAY_MS = 250;
+	const SPOTIFY_RESOLVE_CONCURRENCY = 3;
+	const SPOTIFY_LIKE_CONCURRENCY = 3;
+	const spotifyBackgroundActive = new Set<string>();
+	const songlinkUserCountry = resolveUserCountry();
 
 	const albumDownloadQuality = $derived($userPreferencesStore.playbackQuality as AudioQuality);
 	const albumDownloadMode = $derived($downloadPreferencesStore.mode);
@@ -158,6 +175,13 @@
 
 	onDestroy(unsubscribeRegion);
 
+	$effect(() => {
+		if (!activeSpotifyPlaylist) {
+			return;
+		}
+		void startSpotifyBackgroundResolution(activeSpotifyPlaylist);
+	});
+
 	const MIN_QUERY_LENGTH = 2;
 	const AUTO_SEARCH_DELAY_MS = 300;
 
@@ -191,6 +215,13 @@
 			searchStore.albums.length > 0 ||
 			searchStore.artists.length > 0 ||
 			searchStore.playlists.length > 0
+	);
+	const activeSpotifyPlaylist = $derived(
+		searchStore.playlistSourceUrl
+			? $libraryStore.spotifyPlaylists.find(
+					(playlist) => playlist.sourceUrl === searchStore.playlistSourceUrl
+				) ?? null
+			: null
 	);
 
 	type SearchSection = 'tracks' | 'albums' | 'artists' | 'playlists';
@@ -713,6 +744,233 @@
 		}
 	}
 
+	const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+	function patchSearchSpotifyTrack(spotifyId: string, patch: Partial<SpotifyTrackMetadata>) {
+		if (searchStore.tracks.length === 0) {
+			return;
+		}
+		const key = `spotify:track:${spotifyId}`;
+		let mutated = false;
+		const next = searchStore.tracks.map((track) => {
+			if (!isSonglinkTrack(track) || track.id !== key) {
+				return track;
+			}
+			const updated = { ...track };
+			if (patch.tidalId && updated.tidalId !== patch.tidalId) {
+				updated.tidalId = patch.tidalId;
+				mutated = true;
+			}
+			if (patch.albumImageUrl && updated.thumbnailUrl !== patch.albumImageUrl) {
+				updated.thumbnailUrl = patch.albumImageUrl;
+				mutated = true;
+			}
+			if (patch.isrc && !updated.isrc) {
+				updated.isrc = patch.isrc;
+				mutated = true;
+			}
+			return updated;
+		});
+		if (mutated) {
+			searchStore.tracks = next;
+		}
+	}
+
+	async function resolveSpotifyMetadataBatch(
+		playlistId: string,
+		tracks: SpotifyTrackMetadata[],
+		options: { fetchTrack?: boolean } = {}
+	) {
+		const total = tracks.length;
+		if (total === 0) return;
+		let index = 0;
+		const concurrency = Math.min(SPOTIFY_RESOLVE_CONCURRENCY, total);
+		const fetchTrack = options.fetchTrack ?? false;
+
+		const workers = Array.from({ length: concurrency }, async () => {
+			while (index < total) {
+				const currentIndex = index;
+				index += 1;
+				const current = tracks[currentIndex];
+				if (!current || current.linkStatus === 'missing') {
+					continue;
+				}
+				if (!fetchTrack && current.tidalId && current.linkStatus === 'ready' && current.albumImageUrl) {
+					continue;
+				}
+				const result = await resolveSpotifyMetadataToTidal(current, {
+					userCountry: songlinkUserCountry,
+					songIfSingle: true,
+					fetchTrack
+				});
+				const patch: Partial<SpotifyTrackMetadata> = {};
+				if (result.thumbnailUrl && !current.albumImageUrl) {
+					patch.albumImageUrl = result.thumbnailUrl;
+				}
+				if (result.tidalId) {
+					patch.tidalId = result.tidalId;
+					patch.linkUrl = result.linkUrl;
+					patch.linkStatus = 'ready';
+				} else if (fetchTrack) {
+					patch.linkStatus = 'missing';
+				}
+				if (Object.keys(patch).length > 0) {
+					libraryStore.updateSpotifyTrackMetadata(playlistId, current.spotifyId, patch);
+					patchSearchSpotifyTrack(current.spotifyId, patch);
+				}
+				if (fetchTrack && result.track) {
+					prefetchStreamUrls([result.track], $playerStore.quality, 1);
+				}
+			}
+		});
+
+		await Promise.all(workers);
+	}
+
+	async function startSpotifyBackgroundResolution(playlist: SpotifyPlaylist) {
+		if (spotifyBackgroundActive.has(playlist.id)) {
+			return;
+		}
+		const unresolved = playlist.tracks.filter(
+			(track) => !track.tidalId && track.linkStatus !== 'missing'
+		);
+		if (unresolved.length === 0) {
+			return;
+		}
+		spotifyBackgroundActive.add(playlist.id);
+		for (let i = 0; i < unresolved.length; i += SPOTIFY_BACKGROUND_BATCH) {
+			const batch = unresolved.slice(i, i + SPOTIFY_BACKGROUND_BATCH);
+			await resolveSpotifyMetadataBatch(playlist.id, batch, { fetchTrack: false });
+			if (i + SPOTIFY_BACKGROUND_BATCH < unresolved.length) {
+				await wait(SPOTIFY_BACKGROUND_DELAY_MS);
+			}
+		}
+		spotifyBackgroundActive.delete(playlist.id);
+	}
+
+	async function resolveSpotifyPlaylistTracksForLike(
+		playlist: SpotifyPlaylist,
+		onProgress?: (done: number) => void
+	): Promise<Track[]> {
+		const source = playlist.tracks;
+		const total = source.length;
+		const results: Array<Track | null> = Array.from({ length: total }).fill(null);
+		let completed = 0;
+		let index = 0;
+		const concurrency = Math.min(SPOTIFY_LIKE_CONCURRENCY, total);
+
+		const workers = Array.from({ length: concurrency }, async () => {
+			while (index < total) {
+				const currentIndex = index;
+				index += 1;
+				const current = source[currentIndex];
+				if (!current) {
+					completed += 1;
+					onProgress?.(completed);
+					continue;
+				}
+				let result = await resolveSpotifyMetadataToTidal(current, {
+					userCountry: songlinkUserCountry,
+					songIfSingle: true,
+					fetchTrack: true,
+					resolveAttempts: 5,
+					searchAttempts: 4,
+					minScore: 50,
+					forceScore: 35,
+					allowLooseTitle: true
+				});
+
+				if (!result.tidalId) {
+					result = await resolveSpotifyMetadataToTidal(current, {
+						userCountry: songlinkUserCountry,
+						songIfSingle: true,
+						fetchTrack: true,
+						resolveAttempts: 6,
+						searchAttempts: 5,
+						minScore: 45,
+						forceScore: 30,
+						allowLooseTitle: true
+					});
+				}
+
+				const patch: Partial<SpotifyTrackMetadata> = {};
+				if (result.thumbnailUrl && !current.albumImageUrl) {
+					patch.albumImageUrl = result.thumbnailUrl;
+				}
+				if (result.tidalId) {
+					patch.tidalId = result.tidalId;
+					patch.linkUrl = result.linkUrl;
+					patch.linkStatus = 'ready';
+				} else {
+					patch.linkStatus = 'missing';
+				}
+				if (Object.keys(patch).length > 0) {
+					libraryStore.updateSpotifyTrackMetadata(playlist.id, current.spotifyId, patch);
+					patchSearchSpotifyTrack(current.spotifyId, patch);
+				}
+
+				let resolvedTrack = result.track ?? null;
+				if (!resolvedTrack && result.tidalId) {
+					resolvedTrack = await fetchTrackWithRetry(result.tidalId, 5);
+				}
+				if (resolvedTrack) {
+					results[currentIndex] = resolvedTrack;
+				}
+
+				completed += 1;
+				onProgress?.(completed);
+			}
+		});
+
+		await Promise.all(workers);
+		return results.filter((track): track is Track => Boolean(track));
+	}
+
+	async function handleLikeConvertedPlaylist() {
+		if (likingConverted) {
+			return;
+		}
+		const playlist = activeSpotifyPlaylist;
+		if (!playlist) {
+			return;
+		}
+		if (likingDoneTimeout) {
+			clearTimeout(likingDoneTimeout);
+			likingDoneTimeout = null;
+		}
+		likingDone = false;
+		likingProgress = { done: 0, total: playlist.tracks.length };
+		likingConverted = true;
+
+		try {
+			const resolvedTracks = await resolveSpotifyPlaylistTracksForLike(playlist, (done) => {
+				likingProgress = { done, total: playlist.tracks.length };
+			});
+
+			for (let end = resolvedTracks.length; end > 0; end -= 30) {
+				const start = Math.max(0, end - 30);
+				const batch = resolvedTracks.slice(start, end);
+				if (batch.length > 0) {
+					libraryStore.addLikedTracks(batch);
+				}
+			}
+
+			prefetchStreamUrls(resolvedTracks, $playerStore.quality, 20);
+			likingDone = true;
+		} finally {
+			likingConverted = false;
+			if (likingDone) {
+				likingDoneTimeout = setTimeout(() => {
+					likingProgress = null;
+					likingDone = false;
+					likingDoneTimeout = null;
+				}, 2000);
+			} else {
+				likingProgress = null;
+			}
+		}
+	}
+
 	$effect(() => {
 		const activeIds = new Set(searchStore.albums.map((album) => album.id));
 		let mutated = false;
@@ -970,25 +1228,6 @@
 		} finally {
 			searchStore.isLoading = false;
 		}
-	}
-
-	function buildSpotifySonglinkTracks(tracks: SpotifyTrackMetadata[]): SonglinkTrack[] {
-		return tracks.map((track) => {
-			const durationMs = track.duration ?? 180000;
-			const durationSeconds = Math.max(1, Math.round(durationMs / 1000));
-			return {
-				id: `spotify:track:${track.spotifyId}`,
-				title: track.title || 'Unknown Track',
-				artistName: track.artistName || 'Unknown Artist',
-				duration: durationSeconds,
-				thumbnailUrl: track.albumImageUrl ?? '',
-				sourceUrl: `https://open.spotify.com/track/${track.spotifyId}`,
-				songlinkData: undefined,
-				isSonglinkTrack: true,
-				tidalId: track.tidalId,
-				audioQuality: 'LOSSLESS'
-			};
-		});
 	}
 
 	async function handleSpotifyPlaylistConversion() {
@@ -1380,6 +1619,14 @@
 						{#if searchStore.isPlaylistConversionMode}
 							<div class="mb-6 flex flex-wrap items-center gap-3">
 								<button
+									onclick={handleLikeConvertedPlaylist}
+									disabled={!activeSpotifyPlaylist || likingConverted}
+									class="flex items-center gap-2 rounded-full bg-pink-600 px-6 py-3 font-semibold transition-colors hover:bg-pink-700 disabled:cursor-not-allowed disabled:opacity-60"
+								>
+									<Heart size={20} />
+									{likingConverted ? 'Adding...' : 'Like All'}
+								</button>
+								<button
 									onclick={handlePlayAll}
 									class="flex items-center gap-2 rounded-full bg-rose-600 px-6 py-3 font-semibold transition-colors hover:bg-rose-700"
 								>
@@ -1400,9 +1647,21 @@
 									<Download size={20} />
 									Download All
 								</button>
-								<div class="ml-auto text-sm text-gray-400">
-									{searchStore.tracks.length} of {searchStore.playlistConversionTotal} tracks
-								</div>
+								{#if likingProgress}
+									<div class="ml-auto text-sm text-gray-400">
+										{#if likingDone}
+											Done
+										{:else if likingProgress.done >= likingProgress.total}
+											Finalizing...
+										{:else}
+											{likingProgress.done}/{likingProgress.total}
+										{/if}
+									</div>
+								{:else}
+									<div class="ml-auto text-sm text-gray-400">
+										{searchStore.tracks.length} of {searchStore.playlistConversionTotal} tracks
+									</div>
+								{/if}
 							</div>
 						{/if}
 

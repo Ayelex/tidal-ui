@@ -6,13 +6,17 @@
 		isSonglinkTrack,
 		type PlayableTrack,
 		type Track,
-		type SonglinkTrack,
 		type SpotifyPlaylist,
 		type SpotifyTrackMetadata
 	} from '$lib/types';
 	import { formatArtists } from '$lib/utils';
 	import { prefetchStreamUrls } from '$lib/utils/streamPrefetch';
-	import { fetchSonglinkData, extractTidalInfo, extractTidalSongEntity } from '$lib/utils/songlink';
+	import {
+		buildSpotifySonglinkTracks,
+		fetchTrackWithRetry,
+		resolveSpotifyMetadataToTidal,
+		resolveUserCountry
+	} from '$lib/utils/trackResolution';
 	import { Heart } from 'lucide-svelte';
 
 	let openCustomId = $state<string | null>(null);
@@ -28,272 +32,26 @@
 	let spotifyVisibleCounts = $state<Record<string, number>>({});
 	const SPOTIFY_VISIBLE_DEFAULT = 200;
 	const SPOTIFY_VISIBLE_STEP = 200;
-	const spotifyResolveQueue: Array<{ playlistId: string; track: SpotifyTrackMetadata }> = [];
+	const SPOTIFY_PREFETCH_COUNT = 50;
+	const SPOTIFY_BACKGROUND_BATCH = 120;
+	const SPOTIFY_BACKGROUND_DELAY_MS = 250;
+	const SPOTIFY_RESOLVE_CONCURRENCY = 2;
+	const SPOTIFY_LIKE_CONCURRENCY = 3;
+
+	type SpotifyResolveEntry = {
+		playlistId: string;
+		track: SpotifyTrackMetadata;
+		fetchTrack: boolean;
+		priority: 'high' | 'low';
+	};
+
+	const spotifyResolveQueue: SpotifyResolveEntry[] = [];
 	const spotifyResolvePending = new Set<string>();
+	const spotifyBackgroundActive = new Set<string>();
 	let spotifyResolveInFlight = 0;
-	const SPOTIFY_RESOLVE_CONCURRENCY = 1;
-	const SPOTIFY_LIKE_RESOLVE_ATTEMPTS = 5;
-	const SPOTIFY_LIKE_SEARCH_ATTEMPTS = 3;
-	const SPOTIFY_LIKE_FETCH_ATTEMPTS = 4;
-	const SPOTIFY_LIKE_FORCE_SCORE = 35;
-	const SPOTIFY_LIKE_RETRY_DELAYS_MS = [300, 800, 1600, 3000, 4500];
-	const songlinkUserCountry =
-		typeof navigator !== 'undefined'
-			? navigator.language?.split('-')[1]?.toUpperCase()
-			: undefined;
+	const songlinkUserCountry = resolveUserCountry();
 
 	const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-	const normalizeText = (value: string) =>
-		value
-			.normalize('NFD')
-			.replace(/[\u0300-\u036f]/g, '')
-			.replace(/[^a-z0-9\s]+/gi, '')
-			.toLowerCase()
-			.trim();
-	const stripDecorations = (value: string) =>
-		value
-			.replace(/\s*[\(\[]\s*(feat|ft|featuring|with)\b[^\)\]]*[\)\]]/gi, '')
-			.replace(/\s*-\s*(feat|ft|featuring|with)\b.+$/gi, '')
-			.replace(
-				/\s*-\s*(remaster(?:ed)?|mix|version|edit|live|mono|stereo|deluxe|bonus|explicit|clean|radio|instrumental|acoustic|demo)\b.*$/gi,
-				''
-			)
-			.replace(/\s+/g, ' ')
-			.trim();
-
-	const getTrackArtistLabel = (track: Track): string => {
-		if (track.artists?.length) {
-			return formatArtists(track.artists);
-		}
-		return track.artist?.name ?? '';
-	};
-
-	const buildNormalizedSource = (source: SpotifyTrackMetadata) => {
-		const rawTitle = source.title ?? '';
-		const rawArtist = source.artistName ?? '';
-		const rawAlbum = source.albumName ?? '';
-		const cleanTitle = stripDecorations(rawTitle);
-		const cleanArtist = stripDecorations(rawArtist);
-		const cleanAlbum = stripDecorations(rawAlbum);
-
-		return {
-			targetTitle: normalizeText(cleanTitle || rawTitle),
-			targetArtist: normalizeText(cleanArtist || rawArtist),
-			targetAlbum: normalizeText(cleanAlbum || rawAlbum),
-			targetIsrc: normalizeText(source.isrc ?? '')
-		};
-	};
-
-	const scoreTrackMatch = (
-		candidate: Track,
-		targetTitle: string,
-		targetArtist: string,
-		targetAlbum: string,
-		targetIsrc?: string,
-		targetDurationMs?: number
-	) => {
-		const candidateTitle = normalizeText(candidate.title ?? '');
-		const candidateArtist = normalizeText(getTrackArtistLabel(candidate));
-		const candidateAlbum = normalizeText(candidate.album?.title ?? '');
-		const candidateIsrc = normalizeText(candidate.isrc ?? '');
-		let score = 0;
-
-		if (targetIsrc && candidateIsrc && candidateIsrc === targetIsrc) {
-			score += 80;
-		}
-
-		if (candidateTitle && targetTitle) {
-			if (candidateTitle === targetTitle) {
-				score += 60;
-			} else if (
-				candidateTitle.includes(targetTitle) ||
-				targetTitle.includes(candidateTitle)
-			) {
-				score += 35;
-			}
-		}
-
-		if (candidateArtist && targetArtist) {
-			if (candidateArtist === targetArtist) {
-				score += 30;
-			} else if (
-				candidateArtist.includes(targetArtist) ||
-				targetArtist.includes(candidateArtist)
-			) {
-				score += 15;
-			}
-		}
-
-		if (candidateAlbum && targetAlbum) {
-			if (candidateAlbum === targetAlbum) {
-				score += 20;
-			} else if (
-				candidateAlbum.includes(targetAlbum) ||
-				targetAlbum.includes(candidateAlbum)
-			) {
-				score += 10;
-			}
-		}
-
-		if (typeof targetDurationMs === 'number' && Number.isFinite(targetDurationMs)) {
-			const candidateDurationMs = (candidate.duration ?? 0) * 1000;
-			if (candidateDurationMs > 0) {
-				const diff = Math.abs(candidateDurationMs - targetDurationMs);
-				if (diff <= 2000) {
-					score += 15;
-				} else if (diff <= 5000) {
-					score += 8;
-				} else if (diff > 15000) {
-					score -= 10;
-				}
-			}
-		}
-
-		return score;
-	};
-
-	const tokenOverlap = (sourceValue: string, candidateValue: string) => {
-		if (!sourceValue || !candidateValue) return false;
-		const tokens = sourceValue.split(' ').filter((token) => token.length >= 3);
-		if (tokens.length === 0) return false;
-		const matched = tokens.filter((token) => candidateValue.includes(token));
-		if (tokens.length === 1) return matched.length === 1;
-		return matched.length / tokens.length >= 0.6;
-	};
-
-	const isLikelyTitleMatch = (candidate: Track, targetTitle: string) => {
-		const candidateTitle = normalizeText(candidate.title ?? '');
-		if (!candidateTitle || !targetTitle) return false;
-		if (candidateTitle === targetTitle) return true;
-		if (candidateTitle.includes(targetTitle) || targetTitle.includes(candidateTitle)) {
-			return true;
-		}
-		return tokenOverlap(candidateTitle, targetTitle) || tokenOverlap(targetTitle, candidateTitle);
-	};
-
-	const findBestTrackMatch = (
-		tracks: Track[],
-		source: SpotifyTrackMetadata
-	): { best: Track | null; bestScore: number; targetTitle: string } => {
-		const { targetTitle, targetArtist, targetAlbum, targetIsrc } = buildNormalizedSource(source);
-		if (!targetTitle) {
-			return { best: null, bestScore: 0, targetTitle };
-		}
-		let best: Track | null = null;
-		let bestScore = 0;
-
-		for (const candidate of tracks) {
-			const score = scoreTrackMatch(
-				candidate,
-				targetTitle,
-				targetArtist,
-				targetAlbum,
-				targetIsrc,
-				source.duration
-			);
-			if (score > bestScore) {
-				bestScore = score;
-				best = candidate;
-			}
-		}
-
-		return { best, bestScore, targetTitle };
-	};
-
-	const searchTidalFallback = async (
-		source: SpotifyTrackMetadata
-	): Promise<{ id: number; url: string } | null> => {
-		const queries: string[] = [];
-		const seen = new Set<string>();
-		const pushQuery = (value?: string | null) => {
-			if (!value) return;
-			const trimmed = value.trim();
-			if (!trimmed) return;
-			const key = trimmed.toLowerCase();
-			if (seen.has(key)) return;
-			seen.add(key);
-			queries.push(trimmed);
-		};
-
-		const title = source.title?.trim();
-		const artist = source.artistName?.trim();
-		const album = source.albumName?.trim();
-		const isrc = source.isrc?.trim();
-		const cleanTitle = title ? stripDecorations(title) : undefined;
-		const cleanArtist = artist ? stripDecorations(artist) : undefined;
-		const cleanAlbum = album ? stripDecorations(album) : undefined;
-
-		if (isrc) {
-			pushQuery(isrc);
-			pushQuery(`isrc:${isrc}`);
-		}
-		if (title && artist && album) {
-			pushQuery(`${title} ${artist} ${album}`);
-		}
-		if (title && artist) {
-			pushQuery(`${title} ${artist}`);
-		}
-		if (title && album) {
-			pushQuery(`${title} ${album}`);
-		}
-		if (cleanTitle && cleanArtist && cleanAlbum) {
-			pushQuery(`${cleanTitle} ${cleanArtist} ${cleanAlbum}`);
-		}
-		if (cleanTitle && cleanArtist) {
-			pushQuery(`${cleanTitle} ${cleanArtist}`);
-		}
-		if (cleanTitle && cleanAlbum) {
-			pushQuery(`${cleanTitle} ${cleanAlbum}`);
-		}
-		if (cleanTitle) {
-			pushQuery(cleanTitle);
-		}
-		if (title) {
-			pushQuery(title);
-		}
-
-		const runQueries = async (minScore: number, allowLoose: boolean) => {
-			for (const query of queries) {
-				for (let attempt = 1; attempt <= SPOTIFY_LIKE_SEARCH_ATTEMPTS; attempt += 1) {
-					try {
-						const response = await losslessAPI.searchTracks(query);
-						const items = response?.items ?? [];
-						const { best, bestScore, targetTitle } = findBestTrackMatch(items, source);
-						if (best?.id && Number.isFinite(best.id)) {
-							if (bestScore >= minScore) {
-								return {
-									id: best.id,
-									url: `https://tidal.com/browse/track/${best.id}`
-								};
-							}
-							if (allowLoose && isLikelyTitleMatch(best, targetTitle)) {
-								return {
-									id: best.id,
-									url: `https://tidal.com/browse/track/${best.id}`
-								};
-							}
-						}
-					} catch (error) {
-						if (attempt === SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
-							console.warn('Tidal search fallback failed', error);
-						}
-					}
-					if (attempt < SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
-						const delayMs =
-							SPOTIFY_LIKE_RETRY_DELAYS_MS[
-								Math.min(attempt - 1, SPOTIFY_LIKE_RETRY_DELAYS_MS.length - 1)
-							];
-						await wait(delayMs);
-					}
-				}
-			}
-			return null;
-		};
-
-		const strictMatch = await runQueries(50, false);
-		if (strictMatch) return strictMatch;
-		return runQueries(SPOTIFY_LIKE_FORCE_SCORE, true);
-	};
 
 	function toggleCustomOpen(id: string) {
 		openCustomId = openCustomId === id ? null : id;
@@ -316,27 +74,6 @@
 		if (playlist) {
 			primeSpotifyMetadata(playlist);
 		}
-	}
-
-	function buildSpotifySonglinkTracks(tracks: SpotifyTrackMetadata[]): SonglinkTrack[] {
-		return tracks.map((track) => {
-			const durationSeconds = Math.max(
-				1,
-				Math.round((track.duration ?? 180000) / 1000)
-			);
-			return {
-				id: `spotify:track:${track.spotifyId}`,
-				title: track.title,
-				artistName: track.artistName,
-				duration: durationSeconds,
-				thumbnailUrl: track.albumImageUrl ?? '',
-				sourceUrl: `https://open.spotify.com/track/${track.spotifyId}`,
-				songlinkData: undefined,
-				isSonglinkTrack: true,
-				tidalId: track.tidalId,
-				audioQuality: 'LOSSLESS'
-			};
-		});
 	}
 
 	function getSpotifyVisibleCount(playlist: SpotifyPlaylist): number {
@@ -364,6 +101,9 @@
 		if (!playlist.tracks.length) {
 			return;
 		}
+		const start = Math.max(0, index - Math.floor(SPOTIFY_PREFETCH_COUNT / 2));
+		ensureSpotifyBootstrapResolution(playlist, start);
+		void startSpotifyBackgroundResolution(playlist);
 		const playable = playlist.tracks.filter((track) => track.linkStatus !== 'missing');
 		const selected = playlist.tracks[index];
 		const playableIndex = playable.findIndex(
@@ -376,22 +116,11 @@
 		playerStore.playQueue(queue, playableIndex);
 	}
 
-	function findBestThumbnail(response: Awaited<ReturnType<typeof fetchSonglinkData>>): string | null {
-		const tidalEntity = extractTidalSongEntity(response);
-		if (tidalEntity?.thumbnailUrl) {
-			return tidalEntity.thumbnailUrl;
-		}
-		const spotifyEntity = Object.values(response.entitiesByUniqueId).find(
-			(entity) => entity.apiProvider === 'spotify' && entity.thumbnailUrl
-		);
-		if (spotifyEntity?.thumbnailUrl) {
-			return spotifyEntity.thumbnailUrl;
-		}
-		const anyEntity = Object.values(response.entitiesByUniqueId).find((entity) => entity.thumbnailUrl);
-		return anyEntity?.thumbnailUrl ?? null;
-	}
-
-	function queueSpotifyTrackResolution(playlistId: string, track: SpotifyTrackMetadata) {
+	function queueSpotifyTrackResolution(
+		playlistId: string,
+		track: SpotifyTrackMetadata,
+		options: { fetchTrack?: boolean; priority?: 'high' | 'low' } = {}
+	) {
 		const key = `${playlistId}:${track.spotifyId}`;
 		if (spotifyResolvePending.has(key)) {
 			return;
@@ -399,13 +128,22 @@
 		if (track.linkStatus === 'missing') {
 			return;
 		}
-		if (track.linkUrl || track.tidalId) {
-			if (track.albumImageUrl) {
-				return;
-			}
+		const fetchTrack = options.fetchTrack ?? false;
+		if (track.tidalId && track.linkStatus === 'ready' && track.albumImageUrl && !fetchTrack) {
+			return;
 		}
+		const entry: SpotifyResolveEntry = {
+			playlistId,
+			track,
+			fetchTrack,
+			priority: options.priority ?? 'low'
+		};
 		spotifyResolvePending.add(key);
-		spotifyResolveQueue.push({ playlistId, track });
+		if (entry.priority === 'high') {
+			spotifyResolveQueue.unshift(entry);
+		} else {
+			spotifyResolveQueue.push(entry);
+		}
 		drainSpotifyResolveQueue();
 	}
 
@@ -430,39 +168,76 @@
 		}
 	}
 
-	async function resolveSpotifyTrackMetadata(entry: {
-		playlistId: string;
-		track: SpotifyTrackMetadata;
-	}) {
-		const spotifyUrl = `https://open.spotify.com/track/${entry.track.spotifyId}`;
-		const songlinkData = await fetchSonglinkData(spotifyUrl, {
+	async function resolveSpotifyTrackMetadata(entry: SpotifyResolveEntry) {
+		const result = await resolveSpotifyMetadataToTidal(entry.track, {
 			userCountry: songlinkUserCountry,
-			songIfSingle: true
+			songIfSingle: true,
+			fetchTrack: entry.fetchTrack
 		});
-		const tidalInfo = extractTidalInfo(songlinkData);
-		const thumbnailUrl = findBestThumbnail(songlinkData);
 		const patch: Partial<SpotifyTrackMetadata> = {};
-		if (thumbnailUrl && !entry.track.albumImageUrl) {
-			patch.albumImageUrl = thumbnailUrl;
+		if (result.thumbnailUrl && !entry.track.albumImageUrl) {
+			patch.albumImageUrl = result.thumbnailUrl;
 		}
-		if (tidalInfo?.id) {
-			const tidalId = Number(tidalInfo.id);
-			if (Number.isFinite(tidalId)) {
-				patch.tidalId = tidalId;
-			}
-			patch.linkUrl = tidalInfo.url;
+		if (result.tidalId) {
+			patch.tidalId = result.tidalId;
+			patch.linkUrl = result.linkUrl;
 			patch.linkStatus = 'ready';
-		} else {
+		} else if (entry.fetchTrack) {
 			patch.linkStatus = 'missing';
 		}
-		libraryStore.updateSpotifyTrackMetadata(entry.playlistId, entry.track.spotifyId, patch);
+		if (Object.keys(patch).length > 0) {
+			libraryStore.updateSpotifyTrackMetadata(entry.playlistId, entry.track.spotifyId, patch);
+		}
+		if (entry.fetchTrack && result.track) {
+			prefetchStreamUrls([result.track], $playerStore.quality, 1);
+		}
+	}
+
+	function ensureSpotifyBootstrapResolution(playlist: SpotifyPlaylist, startIndex = 0) {
+		const slice = playlist.tracks.slice(startIndex, startIndex + SPOTIFY_PREFETCH_COUNT);
+		for (const track of slice) {
+			queueSpotifyTrackResolution(playlist.id, track, {
+				fetchTrack: true,
+				priority: 'high'
+			});
+		}
+	}
+
+	async function startSpotifyBackgroundResolution(playlist: SpotifyPlaylist) {
+		if (spotifyBackgroundActive.has(playlist.id)) {
+			return;
+		}
+		spotifyBackgroundActive.add(playlist.id);
+		const latest = $libraryStore.spotifyPlaylists.find((item) => item.id === playlist.id);
+		const sourceTracks = latest?.tracks ?? playlist.tracks;
+		const unresolved = sourceTracks.filter(
+			(track) => !track.tidalId && track.linkStatus !== 'missing'
+		);
+		for (let i = 0; i < unresolved.length; i += SPOTIFY_BACKGROUND_BATCH) {
+			const batch = unresolved.slice(i, i + SPOTIFY_BACKGROUND_BATCH);
+			for (const track of batch) {
+				queueSpotifyTrackResolution(playlist.id, track, {
+					fetchTrack: !track.albumImageUrl,
+					priority: 'low'
+				});
+			}
+			if (i + SPOTIFY_BACKGROUND_BATCH < unresolved.length) {
+				await wait(SPOTIFY_BACKGROUND_DELAY_MS);
+			}
+		}
+		spotifyBackgroundActive.delete(playlist.id);
 	}
 
 	function primeSpotifyMetadata(playlist: SpotifyPlaylist) {
 		const visibleTracks = getSpotifyVisibleTracks(playlist);
 		for (const track of visibleTracks) {
-			queueSpotifyTrackResolution(playlist.id, track);
+			queueSpotifyTrackResolution(playlist.id, track, {
+				fetchTrack: true,
+				priority: 'high'
+			});
 		}
+		ensureSpotifyBootstrapResolution(playlist, 0);
+		void startSpotifyBackgroundResolution(playlist);
 	}
 
 	function beginRenameSpotifyPlaylist(playlist: SpotifyPlaylist) {
@@ -487,47 +262,74 @@
 		return playlist.tracks.length > 0;
 	}
 
-	async function fetchTrackWithRetry(
-		id: number,
-		attempts = SPOTIFY_LIKE_FETCH_ATTEMPTS
-	): Promise<Track | null> {
-		for (let attempt = 1; attempt <= attempts; attempt += 1) {
-			try {
-				const data = await losslessAPI.getTrack(id);
-				if (data?.track) {
-					return data.track;
-				}
-			} catch (error) {
-				if (attempt === attempts) {
-					console.warn('Failed to fetch track after retries', error);
-				}
-			}
-			if (attempt < attempts) {
-				const delayMs =
-					SPOTIFY_LIKE_RETRY_DELAYS_MS[Math.min(attempt - 1, SPOTIFY_LIKE_RETRY_DELAYS_MS.length - 1)];
-				await wait(delayMs);
-			}
-		}
-		return null;
-	}
-
-	async function fetchTidalTracks(ids: number[], concurrency = 4): Promise<Track[]> {
-		if (ids.length === 0) return [];
-		const results = new Map<number, Track>();
+	async function resolveSpotifyPlaylistTracks(
+		playlist: SpotifyPlaylist,
+		onProgress?: (done: number) => void
+	): Promise<Track[]> {
+		const latest = $libraryStore.spotifyPlaylists.find((item) => item.id === playlist.id);
+		const sourceTracks = latest?.tracks ?? playlist.tracks;
+		const total = sourceTracks.length;
+		const results: Array<Track | null> = Array.from({ length: total }).fill(null);
+		let completed = 0;
 		let index = 0;
-		const workers = Array.from({ length: Math.min(concurrency, ids.length) }, async () => {
-			while (index < ids.length) {
-				const nextId = ids[index];
+		const concurrency = Math.min(SPOTIFY_LIKE_CONCURRENCY, total);
+
+		const workers = Array.from({ length: concurrency }, async () => {
+			while (index < total) {
+				const currentIndex = index;
 				index += 1;
-				if (!Number.isFinite(nextId)) continue;
-				const track = await fetchTrackWithRetry(nextId);
-				if (track) {
-					results.set(nextId, track);
+				const current = sourceTracks[currentIndex];
+				let result = await resolveSpotifyMetadataToTidal(current, {
+					userCountry: songlinkUserCountry,
+					songIfSingle: true,
+					fetchTrack: true,
+					resolveAttempts: 5,
+					searchAttempts: 4,
+					minScore: 50,
+					forceScore: 35,
+					allowLooseTitle: true
+				});
+
+				if (!result.tidalId) {
+					result = await resolveSpotifyMetadataToTidal(current, {
+						userCountry: songlinkUserCountry,
+						songIfSingle: true,
+						fetchTrack: true,
+						resolveAttempts: 6,
+						searchAttempts: 5,
+						minScore: 45,
+						forceScore: 30,
+						allowLooseTitle: true
+					});
 				}
+				const patch: Partial<SpotifyTrackMetadata> = {};
+				if (result.thumbnailUrl && !current.albumImageUrl) {
+					patch.albumImageUrl = result.thumbnailUrl;
+				}
+				if (result.tidalId) {
+					patch.tidalId = result.tidalId;
+					patch.linkUrl = result.linkUrl;
+					patch.linkStatus = 'ready';
+				} else if (!current.tidalId) {
+					patch.linkStatus = 'missing';
+				}
+				if (Object.keys(patch).length > 0) {
+					libraryStore.updateSpotifyTrackMetadata(playlist.id, current.spotifyId, patch);
+				}
+				let resolvedTrack = result.track ?? null;
+				if (!resolvedTrack && result.tidalId) {
+					resolvedTrack = await fetchTrackWithRetry(result.tidalId, 4);
+				}
+				if (resolvedTrack) {
+					results[currentIndex] = resolvedTrack;
+				}
+				completed += 1;
+				onProgress?.(completed);
 			}
 		});
+
 		await Promise.all(workers);
-		return ids.map((id) => results.get(id)).filter((track): track is Track => Boolean(track));
+		return results.filter((track): track is Track => Boolean(track));
 	}
 
 	async function handleLikeSpotifyPlaylist(playlist: SpotifyPlaylist) {
@@ -552,7 +354,7 @@
 		likingSpotifyIds = next;
 		let completed = false;
 		try {
-			await resolveSpotifyTidalIds(playlist, (done) => {
+			const resolvedTracks = await resolveSpotifyPlaylistTracks(playlist, (done) => {
 				const current = likingSpotifyProgress[playlist.id];
 				if (!current) return;
 				likingSpotifyProgress = {
@@ -561,20 +363,15 @@
 				};
 			});
 
-			const refreshed = $libraryStore.spotifyPlaylists.find((item) => item.id === playlist.id);
-			const orderedIds = (refreshed?.tracks ?? playlist.tracks)
-				.map((track) => track.tidalId)
-				.filter((id): id is number => typeof id === 'number' && Number.isFinite(id));
-
 			// Add in reverse batches so addLikedTracks (which prepends) preserves Spotify order.
-			for (let end = orderedIds.length; end > 0; end -= 30) {
+			for (let end = resolvedTracks.length; end > 0; end -= 30) {
 				const start = Math.max(0, end - 30);
-				const batch = orderedIds.slice(start, end);
-				const tracks = await fetchTidalTracks(batch, 1);
-				if (tracks.length > 0) {
-					libraryStore.addLikedTracks(tracks);
+				const batch = resolvedTracks.slice(start, end);
+				if (batch.length > 0) {
+					libraryStore.addLikedTracks(batch);
 				}
 			}
+			prefetchStreamUrls(resolvedTracks, $playerStore.quality, 20);
 			completed = true;
 		} finally {
 			const cleared = new Set(likingSpotifyIds);
@@ -605,99 +402,6 @@
 				likingSpotifyProgress = nextProgress;
 			}
 		}
-	}
-
-	async function resolveSpotifyTidalIds(
-		playlist: SpotifyPlaylist,
-		onProgress?: (done: number) => void,
-		onResolved?: (tidalId: number) => void
-	): Promise<number[]> {
-		const existingIds = playlist.tracks
-			.map((track) => track.tidalId)
-			.filter((id): id is number => typeof id === 'number' && Number.isFinite(id));
-		for (const id of existingIds) {
-			onResolved?.(id);
-		}
-		const missing = playlist.tracks.filter((track) => !track.tidalId);
-		onProgress?.(playlist.tracks.length - missing.length);
-		if (missing.length === 0) {
-			return existingIds;
-		}
-
-		const resolvedIds = [...existingIds];
-		let index = 0;
-		const concurrency = Math.min(SPOTIFY_RESOLVE_CONCURRENCY, missing.length);
-
-		const workers = Array.from({ length: concurrency }, async () => {
-			while (index < missing.length) {
-				const current = missing[index];
-				index += 1;
-				const spotifyUrl = `https://open.spotify.com/track/${current.spotifyId}`;
-				let resolvedId: number | null = null;
-				let resolvedUrl: string | undefined;
-				let resolvedThumbnail: string | null = null;
-
-				for (let attempt = 1; attempt <= SPOTIFY_LIKE_RESOLVE_ATTEMPTS; attempt += 1) {
-					try {
-						const songlinkData = await fetchSonglinkData(spotifyUrl, {
-							userCountry: songlinkUserCountry,
-							songIfSingle: true
-						});
-						const tidalInfo = extractTidalInfo(songlinkData);
-						if (!resolvedThumbnail) {
-							resolvedThumbnail = findBestThumbnail(songlinkData);
-						}
-						if (tidalInfo?.id) {
-							const tidalId = Number(tidalInfo.id);
-							if (Number.isFinite(tidalId)) {
-								resolvedId = tidalId;
-								resolvedUrl = tidalInfo.url;
-								break;
-							}
-						}
-					} catch (error) {
-						if (attempt === SPOTIFY_LIKE_RESOLVE_ATTEMPTS) {
-							console.warn('Failed to resolve Spotify track for likes', error);
-							break;
-						}
-					}
-					const delayMs =
-						SPOTIFY_LIKE_RETRY_DELAYS_MS[
-							Math.min(attempt - 1, SPOTIFY_LIKE_RETRY_DELAYS_MS.length - 1)
-						];
-					await wait(delayMs);
-				}
-
-				if (!resolvedId) {
-					const fallback = await searchTidalFallback(current);
-					if (fallback?.id) {
-						resolvedId = fallback.id;
-						resolvedUrl = fallback.url;
-					}
-				}
-
-				const patch: Partial<SpotifyTrackMetadata> = {};
-				if (resolvedThumbnail && !current.albumImageUrl) {
-					patch.albumImageUrl = resolvedThumbnail;
-				}
-				if (resolvedId && Number.isFinite(resolvedId)) {
-					patch.tidalId = resolvedId;
-					patch.linkUrl = resolvedUrl;
-					patch.linkStatus = 'ready';
-					resolvedIds.push(resolvedId);
-					onResolved?.(resolvedId);
-				} else {
-					patch.linkStatus = 'missing';
-				}
-				if (Object.keys(patch).length > 0) {
-					libraryStore.updateSpotifyTrackMetadata(playlist.id, current.spotifyId, patch);
-				}
-				onProgress?.(playlist.tracks.length - (missing.length - index));
-			}
-		});
-
-		await Promise.all(workers);
-		return resolvedIds;
 	}
 
 	async function prefetchSavedPlaylists() {

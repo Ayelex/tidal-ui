@@ -11,6 +11,8 @@
 		iconOnly?: boolean;
 		variant?: 'ghost' | 'primary' | 'secondary';
 		open?: boolean;
+		buttonClass?: string;
+		menuClass?: string;
 	}
 
 	let { 
@@ -20,7 +22,9 @@
 		size = 20, 
 		iconOnly = false,
 		variant = 'ghost',
-		open = undefined
+		open = undefined,
+		buttonClass = '',
+		menuClass = ''
 	}: Props = $props();
 
 	let showMenu = $state(false);
@@ -36,7 +40,7 @@
 	});
 
 	function getLongLink() {
-		return `https://music.binimum.org/${type}/${id}`;
+		return `https://riptify.uk/${type}/${id}`;
 	}
 
 	function getShortLink() {
@@ -46,12 +50,12 @@
 			artist: 'ar',
 			playlist: 'p'
 		};
-		return `https://okiw.me/${prefixMap[type]}/${id}`;
+		return `https://riptify.uk/${prefixMap[type]}/${id}`;
 	}
 
 	function getEmbedCode() {
-        if (type === "track") return `<iframe src="https://music.binimum.org/embed/${type}/${id}" width="100%" height="150" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
-		return `<iframe src="https://music.binimum.org/embed/${type}/${id}" width="100%" height="450" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
+        if (type === "track") return `<iframe src="https://riptify.uk/embed/${type}/${id}" width="100%" height="150" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
+		return `<iframe src="https://riptify.uk/embed/${type}/${id}" width="100%" height="450" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
 	}
 
 	async function copyToClipboard(text: string) {
@@ -122,7 +126,7 @@
 <div class={`share-wrapper relative inline-block ${showMenu ? 'share-wrapper--open' : ''}`}>
 	<button
 		bind:this={buttonRef}
-		class="flex items-center gap-2 rounded-full transition-colors {variantClasses[variant]} {iconOnly ? 'p-2' : 'px-4 py-2'}"
+		class="flex items-center gap-2 rounded-full transition-colors {variantClasses[variant]} {iconOnly ? 'p-2' : 'px-4 py-2'} {buttonClass}"
 		onclick={(e) => {
 			e.stopPropagation();
 			setMenu(!showMenu);
@@ -146,7 +150,7 @@
 		<div
 			bind:this={menuRef}
 			transition:scale={{ duration: 100, start: 0.95 }}
-			class="share-menu absolute right-0 top-full mt-2 w-48 origin-top-right rounded-lg border border-white/10 bg-gray-900 p-1 shadow-xl backdrop-blur-xl"
+			class="share-menu absolute right-0 top-full mt-2 w-48 origin-top-right rounded-lg border border-white/10 bg-gray-900 p-1 shadow-xl backdrop-blur-xl {menuClass}"
 		>
 			<button
 				class="flex w-full items-center gap-2 rounded px-3 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"

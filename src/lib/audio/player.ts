@@ -4,7 +4,7 @@ import { losslessAPI } from '$lib/api';
 import { getProxiedUrl } from '$lib/config';
 import { userPreferencesStore } from '$lib/stores/userPreferences';
 import { deriveTrackQuality } from '$lib/utils/audioQuality';
-import { convertToTidal, extractTidalInfo, fetchSonglinkData } from '$lib/utils/songlink';
+import { resolveSonglinkTrackToTidal, resolveUserCountry } from '$lib/utils/trackResolution';
 import type { AudioQuality, PlayableTrack, SonglinkTrack, Track } from '$lib/types';
 import { isSonglinkTrack } from '$lib/types';
 import { audioReducer, type AudioState, type PlaybackStatus, type RepeatMode } from './state';
@@ -677,32 +677,15 @@ export class AudioController {
 			return existing;
 		}
 		const conversion = (async () => {
-			if (track.tidalId) {
-				const lookup = await losslessAPI.getTrack(track.tidalId);
-				return lookup.track;
+			const resolved = await resolveSonglinkTrackToTidal(track, {
+				userCountry: resolveUserCountry(),
+				songIfSingle: true,
+				fetchTrack: true
+			});
+			if (!resolved.track) {
+				throw new Error('Unable to resolve track');
 			}
-			let songlinkData = track.songlinkData;
-			if (!songlinkData) {
-				try {
-					songlinkData = await fetchSonglinkData(track.sourceUrl);
-					track.songlinkData = songlinkData;
-				} catch (error) {
-					if (dev) {
-						console.warn('Songlink fetch failed, falling back to conversion', error);
-					}
-				}
-			}
-			const tidalInfo = songlinkData ? extractTidalInfo(songlinkData) : null;
-			if (!tidalInfo) {
-				const fallback = await convertToTidal(track.sourceUrl);
-				if (!fallback?.id) {
-					throw new Error('Unable to resolve track');
-				}
-				const lookup = await losslessAPI.getTrack(Number(fallback.id));
-				return lookup.track;
-			}
-			const lookup = await losslessAPI.getTrack(Number(tidalInfo.id));
-			return lookup.track;
+			return resolved.track;
 		})();
 		this.convertingTracks.set(track.id, conversion);
 		try {

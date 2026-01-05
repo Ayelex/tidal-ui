@@ -196,6 +196,7 @@ export interface SonglinkTrack {
 	id: string;
 	title: string;
 	artistName: string;
+	albumName?: string;
 	// Duration is unknown from Songlink, use placeholder
 	duration: number;
 	thumbnailUrl: string;
@@ -207,6 +208,7 @@ export interface SonglinkTrack {
 	isSonglinkTrack: true;
 	// Optional Tidal ID if available
 	tidalId?: number;
+	isrc?: string;
 	// Assume CD quality for display purposes
 	audioQuality: 'LOSSLESS';
 }

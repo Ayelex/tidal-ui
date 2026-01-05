@@ -8,6 +8,7 @@
 	import { libraryStore } from '$lib/stores/library';
 	import { buildTrackFilename } from '$lib/downloads';
 	import { formatArtists } from '$lib/utils';
+	import ShareButton from '$lib/components/ShareButton.svelte';
 	import type { Track, PlayableTrack } from '$lib/types';
 	import { isSonglinkTrack } from '$lib/types';
 	import { slide } from 'svelte/transition';
@@ -30,7 +31,8 @@
 		Repeat,
 		Repeat1,
 		ChevronDown,
-		ChevronUp
+		ChevronUp,
+		Share2
 	} from 'lucide-svelte';
 
 	const { onHeightChange = () => {}, headless = false } = $props<{
@@ -72,6 +74,14 @@
 	const bufferedPercent = $derived($playerStore.bufferedPercent);
 	const isMuted = $derived($playerStore.muted);
 	const showAutoplayPrompt = $derived($playerStore.needsGesture);
+	const shareTrackId = $derived(
+		$playerStore.currentTrack
+			? isSonglinkTrack($playerStore.currentTrack)
+				? $playerStore.currentTrack.tidalId ?? null
+				: asTrack($playerStore.currentTrack).id
+			: null
+	);
+	const canShareTrack = $derived(Boolean(shareTrackId));
 
 	$effect(() => {
 		if (showQueuePanel && $playerStore.queue.length === 0) {
@@ -853,6 +863,27 @@
 									{/if}
 									<span class="hidden sm:inline">Download</span>
 								</button>
+								{#if canShareTrack}
+									<ShareButton
+										type="track"
+										id={shareTrackId}
+										title="Share track"
+										size={16}
+										iconOnly={false}
+										variant="ghost"
+										buttonClass="player-toggle-button p-1.5 sm:p-2"
+									/>
+								{:else}
+									<button
+										class="player-toggle-button p-1.5 sm:p-2"
+										aria-label="Share track"
+										type="button"
+										disabled
+									>
+										<Share2 size={16} class="sm:w-[18px] sm:h-[18px]" />
+										<span class="hidden sm:inline">Share</span>
+									</button>
+								{/if}
 								<button
 									onclick={() => lyricsStore.toggle()}
 									class="player-toggle-button p-1.5 sm:p-2 {$lyricsStore.open
@@ -1414,5 +1445,3 @@
 		box-shadow: inset 0 0 20px rgba(239, 68, 68, 0.18);
 	}
 </style>
-
-

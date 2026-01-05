@@ -30,7 +30,7 @@
 		if (tracks.length === 0) {
 			return;
 		}
-		prefetchStreamUrls(tracks, $playerStore.quality, 8);
+		prefetchStreamUrls(tracks, $playerStore.quality, 25);
 	});
 
 	function getDisplayTags(tags?: string[] | null): string[] {
