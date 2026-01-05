@@ -25,8 +25,35 @@ function sendFile(response, filePath) {
 	createReadStream(filePath).pipe(response);
 }
 
+function buildPublicEnv() {
+	const publicEnv = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (key.startsWith('PUBLIC_') && typeof value === 'string') {
+			publicEnv[key] = value;
+		}
+	}
+	if (!publicEnv.PUBLIC_TITLE && process.env.TITLE) {
+		publicEnv.PUBLIC_TITLE = process.env.TITLE;
+	}
+	if (!publicEnv.PUBLIC_SLOGAN && process.env.SLOGAN) {
+		publicEnv.PUBLIC_SLOGAN = process.env.SLOGAN;
+	}
+	return publicEnv;
+}
+
 const server = createServer((request, response) => {
 	const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+
+	if (url.pathname === '/_app/env.js') {
+		const envPayload = buildPublicEnv();
+		response.writeHead(200, {
+			'Content-Type': 'application/javascript; charset=utf-8',
+			'Cache-Control': 'no-store'
+		});
+		response.end(`export const env=${JSON.stringify(envPayload)};`);
+		return;
+	}
+
 	let filePath = join(rootDir, decodeURIComponent(url.pathname));
 
 	if (filePath.endsWith('/') || extname(filePath) === '') {
