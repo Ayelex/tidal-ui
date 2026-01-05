@@ -23,7 +23,6 @@ WORKDIR /app
 
 # Copy the built app and production node_modules from the builder stage
 COPY --from=builder /app/build build/
-COPY --from=builder /app/server.js server.js
 COPY --from=builder /app/node_modules node_modules/
 COPY package.json .
 
@@ -34,4 +33,4 @@ EXPOSE 5000
 ENV NODE_ENV=production
 
 # Specify the command to run the app
-CMD ["node", "server.js"]
+CMD ["node", "build"]

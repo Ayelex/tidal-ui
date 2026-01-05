@@ -7,9 +7,7 @@ import { dev } from '$app/environment';
 
 const SONGLINK_API_BASE = 'https://api.song.link/v1-alpha.1/links';
 const SONGLINK_BACKUP_API_BASE = 'https://tracks.monochrome.tf/api/links';
-const spotifyPlaylistApi = (
-	env.PUBLIC_SPOTIFY_PLAYLIST_API || (dev ? '/api/spotify-playlist' : '')
-).trim();
+const spotifyPlaylistApi = (env.PUBLIC_SPOTIFY_PLAYLIST_API || '/api/spotify-playlist').trim();
 export const spotifyPlaylistConversionEnabled = Boolean(spotifyPlaylistApi);
 
 export interface SonglinkResponse {
