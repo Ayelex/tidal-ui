@@ -31,12 +31,129 @@
 	const spotifyResolveQueue: Array<{ playlistId: string; track: SpotifyTrackMetadata }> = [];
 	const spotifyResolvePending = new Set<string>();
 	let spotifyResolveInFlight = 0;
-	const SPOTIFY_RESOLVE_CONCURRENCY = 4;
-	const SPOTIFY_LIKE_RESOLVE_ATTEMPTS = 3;
+	const SPOTIFY_RESOLVE_CONCURRENCY = 2;
+	const SPOTIFY_LIKE_RESOLVE_ATTEMPTS = 4;
+	const SPOTIFY_LIKE_SEARCH_ATTEMPTS = 2;
 	const SPOTIFY_LIKE_FETCH_ATTEMPTS = 3;
-	const SPOTIFY_LIKE_RETRY_DELAYS_MS = [250, 750, 1500];
+	const SPOTIFY_LIKE_RETRY_DELAYS_MS = [250, 750, 1500, 2500];
 
 	const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+	const normalizeText = (value: string) =>
+		value
+			.normalize('NFD')
+			.replace(/[\u0300-\u036f]/g, '')
+			.replace(/[^a-z0-9\s]+/gi, '')
+			.toLowerCase()
+			.trim();
+
+	const getTrackArtistLabel = (track: Track): string => {
+		if (track.artists?.length) {
+			return formatArtists(track.artists);
+		}
+		return track.artist?.name ?? '';
+	};
+
+	const scoreTrackMatch = (
+		candidate: Track,
+		targetTitle: string,
+		targetArtist: string,
+		targetDurationMs?: number
+	) => {
+		const candidateTitle = normalizeText(candidate.title ?? '');
+		const candidateArtist = normalizeText(getTrackArtistLabel(candidate));
+		let score = 0;
+
+		if (candidateTitle && targetTitle) {
+			if (candidateTitle === targetTitle) {
+				score += 60;
+			} else if (
+				candidateTitle.includes(targetTitle) ||
+				targetTitle.includes(candidateTitle)
+			) {
+				score += 35;
+			}
+		}
+
+		if (candidateArtist && targetArtist) {
+			if (candidateArtist === targetArtist) {
+				score += 30;
+			} else if (
+				candidateArtist.includes(targetArtist) ||
+				targetArtist.includes(candidateArtist)
+			) {
+				score += 15;
+			}
+		}
+
+		if (typeof targetDurationMs === 'number' && Number.isFinite(targetDurationMs)) {
+			const candidateDurationMs = (candidate.duration ?? 0) * 1000;
+			if (candidateDurationMs > 0) {
+				const diff = Math.abs(candidateDurationMs - targetDurationMs);
+				if (diff <= 2000) {
+					score += 15;
+				} else if (diff <= 5000) {
+					score += 8;
+				} else if (diff > 15000) {
+					score -= 10;
+				}
+			}
+		}
+
+		return score;
+	};
+
+	const findBestTrackMatch = (tracks: Track[], source: SpotifyTrackMetadata): Track | null => {
+		const targetTitle = normalizeText(source.title ?? '');
+		const targetArtist = normalizeText(source.artistName ?? '');
+		if (!targetTitle) return null;
+		let best: Track | null = null;
+		let bestScore = 0;
+
+		for (const candidate of tracks) {
+			const score = scoreTrackMatch(candidate, targetTitle, targetArtist, source.duration);
+			if (score > bestScore) {
+				bestScore = score;
+				best = candidate;
+			}
+		}
+
+		return bestScore >= 55 ? best : null;
+	};
+
+	const searchTidalFallback = async (
+		source: SpotifyTrackMetadata
+	): Promise<{ id: number; url: string } | null> => {
+		const queryParts = [source.title, source.artistName].filter(Boolean);
+		if (queryParts.length === 0) return null;
+		const query = queryParts.join(' ');
+
+		for (let attempt = 1; attempt <= SPOTIFY_LIKE_SEARCH_ATTEMPTS; attempt += 1) {
+			try {
+				const response = await losslessAPI.searchTracks(query);
+				const items = response?.items ?? [];
+				const best = findBestTrackMatch(items, source);
+				if (best?.id && Number.isFinite(best.id)) {
+					return {
+						id: best.id,
+						url: `https://tidal.com/browse/track/${best.id}`
+					};
+				}
+			} catch (error) {
+				if (attempt === SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
+					console.warn('Tidal search fallback failed', error);
+				}
+			}
+			if (attempt < SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
+				const delayMs =
+					SPOTIFY_LIKE_RETRY_DELAYS_MS[
+						Math.min(attempt - 1, SPOTIFY_LIKE_RETRY_DELAYS_MS.length - 1)
+					];
+				await wait(delayMs);
+			}
+		}
+
+		return null;
+	};
 
 	function toggleCustomOpen(id: string) {
 		openCustomId = openCustomId === id ? null : id;
@@ -376,7 +493,10 @@
 				const current = missing[index];
 				index += 1;
 				const spotifyUrl = `https://open.spotify.com/track/${current.spotifyId}`;
-				let resolved = false;
+				let resolvedId: number | null = null;
+				let resolvedUrl: string | undefined;
+				let resolvedThumbnail: string | null = null;
+
 				for (let attempt = 1; attempt <= SPOTIFY_LIKE_RESOLVE_ATTEMPTS; attempt += 1) {
 					try {
 						const songlinkData = await fetchSonglinkData(spotifyUrl, {
@@ -384,36 +504,20 @@
 							songIfSingle: true
 						});
 						const tidalInfo = extractTidalInfo(songlinkData);
-						const thumbnailUrl = findBestThumbnail(songlinkData);
-						const patch: Partial<SpotifyTrackMetadata> = {};
-						if (thumbnailUrl && !current.albumImageUrl) {
-							patch.albumImageUrl = thumbnailUrl;
+						if (!resolvedThumbnail) {
+							resolvedThumbnail = findBestThumbnail(songlinkData);
 						}
 						if (tidalInfo?.id) {
 							const tidalId = Number(tidalInfo.id);
 							if (Number.isFinite(tidalId)) {
-								patch.tidalId = tidalId;
-								resolvedIds.push(tidalId);
-								onResolved?.(tidalId);
-								resolved = true;
+								resolvedId = tidalId;
+								resolvedUrl = tidalInfo.url;
+								break;
 							}
-							patch.linkUrl = tidalInfo.url;
-							patch.linkStatus = 'ready';
-						} else if (attempt === SPOTIFY_LIKE_RESOLVE_ATTEMPTS) {
-							patch.linkStatus = 'missing';
-						}
-						if (Object.keys(patch).length > 0) {
-							libraryStore.updateSpotifyTrackMetadata(playlist.id, current.spotifyId, patch);
-						}
-						if (resolved || patch.linkStatus === 'missing') {
-							break;
 						}
 					} catch (error) {
 						if (attempt === SPOTIFY_LIKE_RESOLVE_ATTEMPTS) {
 							console.warn('Failed to resolve Spotify track for likes', error);
-							libraryStore.updateSpotifyTrackMetadata(playlist.id, current.spotifyId, {
-								linkStatus: 'missing'
-							});
 							break;
 						}
 					}
@@ -422,6 +526,31 @@
 							Math.min(attempt - 1, SPOTIFY_LIKE_RETRY_DELAYS_MS.length - 1)
 						];
 					await wait(delayMs);
+				}
+
+				if (!resolvedId) {
+					const fallback = await searchTidalFallback(current);
+					if (fallback?.id) {
+						resolvedId = fallback.id;
+						resolvedUrl = fallback.url;
+					}
+				}
+
+				const patch: Partial<SpotifyTrackMetadata> = {};
+				if (resolvedThumbnail && !current.albumImageUrl) {
+					patch.albumImageUrl = resolvedThumbnail;
+				}
+				if (resolvedId && Number.isFinite(resolvedId)) {
+					patch.tidalId = resolvedId;
+					patch.linkUrl = resolvedUrl;
+					patch.linkStatus = 'ready';
+					resolvedIds.push(resolvedId);
+					onResolved?.(resolvedId);
+				} else {
+					patch.linkStatus = 'missing';
+				}
+				if (Object.keys(patch).length > 0) {
+					libraryStore.updateSpotifyTrackMetadata(playlist.id, current.spotifyId, patch);
 				}
 				onProgress?.(playlist.tracks.length - (missing.length - index));
 			}
