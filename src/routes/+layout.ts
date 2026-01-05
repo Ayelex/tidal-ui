@@ -5,7 +5,9 @@ export const ssr = false;
 
 export const load = () => {
 	return {
-		title: env.PUBLIC_TITLE || 'BiniLossless',
-		slogan: env.PUBLIC_SLOGAN || 'The easiest way to stream CD-quality lossless FLACs.'
+		title: env.PUBLIC_TITLE || 'Riptify',
+		slogan:
+			env.PUBLIC_SLOGAN ||
+			"Ayelex's Music Streaming Service. Enjoy lossless audio and download whatever you want for free!"
 	};
 };
