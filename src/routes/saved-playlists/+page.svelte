@@ -31,11 +31,11 @@
 	const spotifyResolveQueue: Array<{ playlistId: string; track: SpotifyTrackMetadata }> = [];
 	const spotifyResolvePending = new Set<string>();
 	let spotifyResolveInFlight = 0;
-	const SPOTIFY_RESOLVE_CONCURRENCY = 2;
-	const SPOTIFY_LIKE_RESOLVE_ATTEMPTS = 4;
-	const SPOTIFY_LIKE_SEARCH_ATTEMPTS = 2;
-	const SPOTIFY_LIKE_FETCH_ATTEMPTS = 3;
-	const SPOTIFY_LIKE_RETRY_DELAYS_MS = [250, 750, 1500, 2500];
+	const SPOTIFY_RESOLVE_CONCURRENCY = 1;
+	const SPOTIFY_LIKE_RESOLVE_ATTEMPTS = 5;
+	const SPOTIFY_LIKE_SEARCH_ATTEMPTS = 3;
+	const SPOTIFY_LIKE_FETCH_ATTEMPTS = 4;
+	const SPOTIFY_LIKE_RETRY_DELAYS_MS = [300, 800, 1600, 3000, 4500];
 
 	const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 	const normalizeText = (value: string) =>
@@ -57,11 +57,19 @@
 		candidate: Track,
 		targetTitle: string,
 		targetArtist: string,
+		targetAlbum: string,
+		targetIsrc?: string,
 		targetDurationMs?: number
 	) => {
 		const candidateTitle = normalizeText(candidate.title ?? '');
 		const candidateArtist = normalizeText(getTrackArtistLabel(candidate));
+		const candidateAlbum = normalizeText(candidate.album?.title ?? '');
+		const candidateIsrc = normalizeText(candidate.isrc ?? '');
 		let score = 0;
+
+		if (targetIsrc && candidateIsrc && candidateIsrc === targetIsrc) {
+			score += 80;
+		}
 
 		if (candidateTitle && targetTitle) {
 			if (candidateTitle === targetTitle) {
@@ -85,6 +93,17 @@
 			}
 		}
 
+		if (candidateAlbum && targetAlbum) {
+			if (candidateAlbum === targetAlbum) {
+				score += 20;
+			} else if (
+				candidateAlbum.includes(targetAlbum) ||
+				targetAlbum.includes(candidateAlbum)
+			) {
+				score += 10;
+			}
+		}
+
 		if (typeof targetDurationMs === 'number' && Number.isFinite(targetDurationMs)) {
 			const candidateDurationMs = (candidate.duration ?? 0) * 1000;
 			if (candidateDurationMs > 0) {
@@ -105,50 +124,77 @@
 	const findBestTrackMatch = (tracks: Track[], source: SpotifyTrackMetadata): Track | null => {
 		const targetTitle = normalizeText(source.title ?? '');
 		const targetArtist = normalizeText(source.artistName ?? '');
+		const targetAlbum = normalizeText(source.albumName ?? '');
+		const targetIsrc = normalizeText(source.isrc ?? '');
 		if (!targetTitle) return null;
 		let best: Track | null = null;
 		let bestScore = 0;
 
 		for (const candidate of tracks) {
-			const score = scoreTrackMatch(candidate, targetTitle, targetArtist, source.duration);
+			const score = scoreTrackMatch(
+				candidate,
+				targetTitle,
+				targetArtist,
+				targetAlbum,
+				targetIsrc,
+				source.duration
+			);
 			if (score > bestScore) {
 				bestScore = score;
 				best = candidate;
 			}
 		}
 
-		return bestScore >= 55 ? best : null;
+		return bestScore >= 50 ? best : null;
 	};
 
 	const searchTidalFallback = async (
 		source: SpotifyTrackMetadata
 	): Promise<{ id: number; url: string } | null> => {
-		const queryParts = [source.title, source.artistName].filter(Boolean);
-		if (queryParts.length === 0) return null;
-		const query = queryParts.join(' ');
+		const queries = new Set<string>();
+		const title = source.title?.trim();
+		const artist = source.artistName?.trim();
+		const album = source.albumName?.trim();
+		const isrc = source.isrc?.trim();
 
-		for (let attempt = 1; attempt <= SPOTIFY_LIKE_SEARCH_ATTEMPTS; attempt += 1) {
-			try {
-				const response = await losslessAPI.searchTracks(query);
-				const items = response?.items ?? [];
-				const best = findBestTrackMatch(items, source);
-				if (best?.id && Number.isFinite(best.id)) {
-					return {
-						id: best.id,
-						url: `https://tidal.com/browse/track/${best.id}`
-					};
+		if (isrc) {
+			queries.add(isrc);
+			queries.add(`isrc:${isrc}`);
+		}
+		if (title && artist) {
+			queries.add(`${title} ${artist}`);
+		}
+		if (title && artist && album) {
+			queries.add(`${title} ${artist} ${album}`);
+		}
+		if (title && album) {
+			queries.add(`${title} ${album}`);
+		}
+
+		for (const query of queries) {
+			for (let attempt = 1; attempt <= SPOTIFY_LIKE_SEARCH_ATTEMPTS; attempt += 1) {
+				try {
+					const response = await losslessAPI.searchTracks(query);
+					const items = response?.items ?? [];
+					const best = findBestTrackMatch(items, source);
+					if (best?.id && Number.isFinite(best.id)) {
+						return {
+							id: best.id,
+							url: `https://tidal.com/browse/track/${best.id}`
+						};
+					}
+				} catch (error) {
+					if (attempt === SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
+						console.warn('Tidal search fallback failed', error);
+					}
 				}
-			} catch (error) {
-				if (attempt === SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
-					console.warn('Tidal search fallback failed', error);
+				if (attempt < SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
+					const delayMs =
+						SPOTIFY_LIKE_RETRY_DELAYS_MS[
+							Math.min(attempt - 1, SPOTIFY_LIKE_RETRY_DELAYS_MS.length - 1)
+						];
+					await wait(delayMs);
 				}
-			}
-			if (attempt < SPOTIFY_LIKE_SEARCH_ATTEMPTS) {
-				const delayMs =
-					SPOTIFY_LIKE_RETRY_DELAYS_MS[
-						Math.min(attempt - 1, SPOTIFY_LIKE_RETRY_DELAYS_MS.length - 1)
-					];
-				await wait(delayMs);
 			}
 		}
 
@@ -430,7 +476,7 @@
 			for (let end = orderedIds.length; end > 0; end -= 30) {
 				const start = Math.max(0, end - 30);
 				const batch = orderedIds.slice(start, end);
-				const tracks = await fetchTidalTracks(batch, 6);
+				const tracks = await fetchTidalTracks(batch, 1);
 				if (tracks.length > 0) {
 					libraryStore.addLikedTracks(tracks);
 				}
