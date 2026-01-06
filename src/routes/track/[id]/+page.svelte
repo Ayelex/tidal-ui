@@ -222,14 +222,14 @@ const isLiked = $derived(
 					</div>
 				</div>
 
-				<div class="flex gap-4">
+				<div class="flex flex-wrap gap-4">
 					<button
 						onclick={() => {
 							if (track) {
 								playerStore.playTrack(track);
 							}
 						}}
-						class="flex items-center gap-2 rounded-full bg-rose-600 px-8 py-3 font-semibold transition-colors hover:bg-rose-700"
+						class="flex w-full items-center justify-center gap-2 rounded-full bg-rose-600 px-8 py-3 font-semibold transition-colors hover:bg-rose-700 sm:w-auto"
 					>
 						<Play size={20} fill="currentColor" />
 						Play
@@ -238,7 +238,7 @@ const isLiked = $derived(
 					{#if isDownloading}
 						<button
 							onclick={handleCancelDownload}
-							class="flex items-center gap-2 rounded-full bg-red-600 px-8 py-3 font-semibold transition-colors hover:bg-red-700"
+							class="flex w-full items-center justify-center gap-2 rounded-full bg-red-600 px-8 py-3 font-semibold transition-colors hover:bg-red-700 sm:w-auto"
 						>
 							<X size={20} />
 							Cancel
@@ -246,7 +246,7 @@ const isLiked = $derived(
 					{:else if isCancelled}
 						<button
 							disabled
-							class="flex items-center gap-2 rounded-full bg-gray-600 px-8 py-3 font-semibold text-gray-300"
+							class="flex w-full items-center justify-center gap-2 rounded-full bg-gray-600 px-8 py-3 font-semibold text-gray-300 sm:w-auto"
 						>
 							<X size={20} />
 							Cancelled
@@ -254,7 +254,7 @@ const isLiked = $derived(
 					{:else}
 						<button
 							onclick={handleDownload}
-							class="flex items-center gap-2 rounded-full bg-gray-800 px-8 py-3 font-semibold transition-colors hover:bg-gray-700"
+							class="flex w-full items-center justify-center gap-2 rounded-full bg-gray-800 px-8 py-3 font-semibold transition-colors hover:bg-gray-700 sm:w-auto"
 						>
 							<Download size={20} />
 							Download
@@ -263,7 +263,7 @@ const isLiked = $derived(
 
 					<button
 						onclick={toggleLike}
-						class="flex items-center gap-2 rounded-full border border-rose-400/40 px-6 py-3 text-sm font-semibold text-rose-200 transition-colors hover:border-rose-300 hover:text-rose-100"
+						class="flex w-full items-center justify-center gap-2 rounded-full border border-rose-400/40 px-6 py-3 text-sm font-semibold text-rose-200 transition-colors hover:border-rose-300 hover:text-rose-100 sm:w-auto"
 						aria-pressed={isLiked}
 						aria-label={isLiked ? 'Remove from liked tracks' : 'Add to liked tracks'}
 					>
@@ -271,7 +271,13 @@ const isLiked = $derived(
 						{isLiked ? 'Liked' : 'Like'}
 					</button>
 
-					<ShareButton type="track" id={track.id} variant="secondary" />
+					<ShareButton
+						type="track"
+						id={track.id}
+						variant="secondary"
+						fullWidth
+						buttonClass="w-full justify-center px-6 py-3 sm:w-auto"
+					/>
 				</div>
 			</div>
 		</div>

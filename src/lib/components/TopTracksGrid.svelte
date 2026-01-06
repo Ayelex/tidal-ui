@@ -7,6 +7,7 @@
 	import { userPreferencesStore } from '$lib/stores/userPreferences';
 	import { formatArtists } from '$lib/utils';
 	import { prefetchStreamUrls } from '$lib/utils/streamPrefetch';
+	import ShareButton from '$lib/components/ShareButton.svelte';
 	import { Play, Pause, Download, ListPlus, Plus, Clock, X } from 'lucide-svelte';
 
 	interface Props {
@@ -33,6 +34,7 @@
 	let downloadingIds = $state(new Set<number>());
 	let downloadTaskIds = $state(new Map<number, string>());
 	let cancelledIds = $state(new Set<number>());
+	let openShareId = $state<number | null>(null);
 	const convertAacToMp3Preference = $derived($userPreferencesStore.convertAacToMp3);
 	const downloadCoverSeperatelyPreference = $derived(
 		$userPreferencesStore.downloadCoversSeperately
@@ -295,6 +297,20 @@
 								<Download size={18} />
 							{/if}
 						</button>
+						<ShareButton
+							type="track"
+							id={track.id}
+							open={openShareId === track.id}
+							iconOnly
+							size={18}
+							title="Share track"
+							compact
+							variant="custom"
+							buttonClass="top-track-action rounded-full p-2"
+							on:toggle={(event) => {
+								openShareId = event.detail.open ? track.id : null;
+							}}
+						/>
 					</div>
 					<div class="flex items-center gap-1 text-xs text-gray-400">
 						<Clock size={14} />
@@ -343,12 +359,12 @@
 		border: 1px solid rgba(255, 255, 255, 0.12);
 	}
 
-	.top-track-action {
+	:global(.top-track-action) {
 		color: rgba(226, 232, 240, 0.78);
 		background: transparent;
 	}
 
-	.top-track-action:hover {
+	:global(.top-track-action:hover) {
 		background: rgba(239, 68, 68, 0.15);
 		color: rgba(254, 226, 226, 0.95);
 	}

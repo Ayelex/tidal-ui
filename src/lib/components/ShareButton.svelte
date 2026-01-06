@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { Share2, Link, Copy, Check, Code } from 'lucide-svelte';
-	import { fade, scale } from 'svelte/transition';
-	import { createEventDispatcher, onMount } from 'svelte';
+	import { Share2 } from 'lucide-svelte';
+	import { createEventDispatcher } from 'svelte';
+	import ShareModal from '$lib/components/ShareModal.svelte';
 
 	interface Props {
 		type: 'track' | 'album' | 'artist' | 'playlist';
@@ -9,193 +9,92 @@
 		title?: string;
 		size?: number;
 		iconOnly?: boolean;
-		variant?: 'ghost' | 'primary' | 'secondary';
+		variant?: 'ghost' | 'primary' | 'secondary' | 'custom';
 		open?: boolean;
 		buttonClass?: string;
 		menuClass?: string;
+		compact?: boolean;
+		labelClass?: string;
+		fullWidth?: boolean;
+		wrapperClass?: string;
 	}
 
-	let { 
-		type, 
-		id, 
-		title = 'Share', 
-		size = 20, 
+	let {
+		type,
+		id,
+		title = 'Share',
+		size = 20,
 		iconOnly = false,
 		variant = 'ghost',
 		open = undefined,
 		buttonClass = '',
-		menuClass = ''
+		menuClass = '',
+		compact = false,
+		labelClass = '',
+		fullWidth = false,
+		wrapperClass = ''
 	}: Props = $props();
 
-	let showMenu = $state(false);
-	let copied = $state(false);
-	let menuRef = $state<HTMLDivElement | null>(null);
-	let buttonRef = $state<HTMLButtonElement | null>(null);
+	let showModal = $state(false);
 	const dispatch = createEventDispatcher<{ toggle: { open: boolean } }>();
 
 	$effect(() => {
 		if (typeof open === 'boolean') {
-			showMenu = open;
+			showModal = open;
 		}
 	});
 
-	function getLongLink() {
-		return `https://riptify.uk/${type}/${id}`;
-	}
-
-	function getShortLink() {
-		const prefixMap = {
-			track: 't',
-			album: 'al',
-			artist: 'ar',
-			playlist: 'p'
-		};
-		return `https://riptify.uk/${prefixMap[type]}/${id}`;
-	}
-
-	function getEmbedCode() {
-        if (type === "track") return `<iframe src="https://riptify.uk/embed/${type}/${id}" width="100%" height="150" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
-		return `<iframe src="https://riptify.uk/embed/${type}/${id}" width="100%" height="450" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
-	}
-
-	async function copyToClipboard(text: string) {
-		try {
-			if (navigator.clipboard && navigator.clipboard.writeText) {
-				await navigator.clipboard.writeText(text);
-			} else {
-				// Fallback for non-secure contexts
-				const textArea = document.createElement('textarea');
-				textArea.value = text;
-				textArea.style.position = 'fixed';
-				textArea.style.left = '-9999px';
-				textArea.style.top = '0';
-				document.body.appendChild(textArea);
-				textArea.focus();
-				textArea.select();
-				try {
-					document.execCommand('copy');
-				} catch (err) {
-					console.error('Fallback: Oops, unable to copy', err);
-					throw err;
-				}
-				document.body.removeChild(textArea);
-			}
-			copied = true;
-			setMenu(false);
-			setTimeout(() => {
-				copied = false;
-			}, 2000);
-		} catch (err) {
-			console.error('Failed to copy:', err);
-		}
-	}
-
-	function setMenu(next: boolean) {
+	function setModal(next: boolean) {
 		if (typeof open === 'boolean') {
 			dispatch('toggle', { open: next });
 			return;
 		}
-		showMenu = next;
+		showModal = next;
 		dispatch('toggle', { open: next });
 	}
-
-	function handleClickOutside(event: MouseEvent) {
-		if (showMenu && 
-			menuRef && 
-			!menuRef.contains(event.target as Node) && 
-			buttonRef && 
-			!buttonRef.contains(event.target as Node)) {
-			setMenu(false);
-		}
-	}
-
-	onMount(() => {
-		document.addEventListener('click', handleClickOutside);
-		return () => {
-			document.removeEventListener('click', handleClickOutside);
-		};
-	});
 
 	const variantClasses = {
 		ghost: 'text-gray-400 hover:text-white hover:bg-white/10',
 		primary: 'bg-rose-600 text-white hover:bg-rose-700',
-		secondary: 'bg-gray-800 text-white hover:bg-gray-700'
+		secondary: 'bg-gray-800 text-white hover:bg-gray-700',
+		custom: ''
 	};
+	const paddingClass = compact ? '' : iconOnly ? 'p-2' : 'px-4 py-2';
 </script>
 
-<div class={`share-wrapper relative inline-block ${showMenu ? 'share-wrapper--open' : ''}`}>
+<div class="share-wrapper {fullWidth ? 'share-wrapper--full' : ''} {wrapperClass}">
 	<button
-		bind:this={buttonRef}
-		class="flex items-center gap-2 rounded-full transition-colors {variantClasses[variant]} {iconOnly ? 'p-2' : 'px-4 py-2'} {buttonClass}"
+		class="flex items-center gap-2 rounded-full transition-colors {variantClasses[variant]} {paddingClass} {buttonClass} {fullWidth ? 'w-full justify-center' : ''}"
 		onclick={(e) => {
 			e.stopPropagation();
-			setMenu(!showMenu);
+			setModal(!showModal);
 		}}
 		{title}
 		aria-label={title}
-		aria-haspopup="true"
-		aria-expanded={showMenu}
+		aria-haspopup="dialog"
+		aria-expanded={showModal}
 	>
-		{#if copied && iconOnly}
-			<Check size={size} class="text-green-500" />
-		{:else}
-			<Share2 size={size} />
-		{/if}
+		<Share2 size={size} />
 		{#if !iconOnly}
-			<span>{copied ? 'Copied!' : 'Share'}</span>
+			<span class={labelClass}>Share</span>
 		{/if}
 	</button>
 
-	{#if showMenu}
-		<div
-			bind:this={menuRef}
-			transition:scale={{ duration: 100, start: 0.95 }}
-			class="share-menu absolute right-0 top-full mt-2 w-48 origin-top-right rounded-lg border border-white/10 bg-gray-900 p-1 shadow-xl backdrop-blur-xl {menuClass}"
-		>
-			<button
-				class="flex w-full items-center gap-2 rounded px-3 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"
-				onclick={(e) => {
-					e.stopPropagation();
-					copyToClipboard(getLongLink());
-				}}
-			>
-				<Link size={16} />
-				Copy Link
-			</button>
-			<button
-				class="flex w-full items-center gap-2 rounded px-3 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"
-				onclick={(e) => {
-					e.stopPropagation();
-					copyToClipboard(getShortLink());
-				}}
-			>
-				<Copy size={16} />
-				Copy Short Link
-			</button>
-			<button
-				class="flex w-full items-center gap-2 rounded px-3 py-2 text-sm text-gray-300 hover:bg-white/10 hover:text-white"
-				onclick={(e) => {
-					e.stopPropagation();
-					copyToClipboard(getEmbedCode());
-				}}
-			>
-				<Code size={16} />
-				Copy Embed Code
-			</button>
-		</div>
-	{/if}
+	<ShareModal
+		open={showModal}
+		type={type}
+		id={id}
+		title={title}
+		on:close={() => setModal(false)}
+	/>
 </div>
 
 <style>
 	.share-wrapper {
 		position: relative;
 	}
-
-	.share-wrapper--open {
-		z-index: 9999;
-	}
-
-	.share-menu {
-		z-index: 9999;
+	.share-wrapper--full {
+		display: block;
+		width: 100%;
 	}
 </style>

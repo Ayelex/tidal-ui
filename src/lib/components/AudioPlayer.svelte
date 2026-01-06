@@ -8,7 +8,7 @@
 	import { libraryStore } from '$lib/stores/library';
 	import { buildTrackFilename } from '$lib/downloads';
 	import { formatArtists } from '$lib/utils';
-	import ShareButton from '$lib/components/ShareButton.svelte';
+	import ShareModal from '$lib/components/ShareModal.svelte';
 	import type { Track, PlayableTrack } from '$lib/types';
 	import { isSonglinkTrack } from '$lib/types';
 	import { slide } from 'svelte/transition';
@@ -51,6 +51,7 @@
 	let canToggleLike = $state(false);
 	let seekBarElement = $state<HTMLButtonElement | null>(null);
 	let isScrubbing = false;
+	let isShareModalOpen = $state(false);
 
 	const repeatModeLabel = $derived(
 		$playerStore.repeatMode === 'one'
@@ -82,6 +83,12 @@
 			: null
 	);
 	const canShareTrack = $derived(Boolean(shareTrackId));
+
+	$effect(() => {
+		if (!canShareTrack && isShareModalOpen) {
+			isShareModalOpen = false;
+		}
+	});
 
 	$effect(() => {
 		if (showQueuePanel && $playerStore.queue.length === 0) {
@@ -438,6 +445,15 @@
 
 
 {#if !headless}
+{#if canShareTrack}
+	<ShareModal
+		open={isShareModalOpen}
+		type="track"
+		id={shareTrackId}
+		title="Share track"
+		on:close={() => (isShareModalOpen = false)}
+	/>
+{/if}
 <div
 	class="audio-player-backdrop fixed inset-x-0 bottom-0 z-50 px-4 pt-16 pb-5 sm:px-6 sm:pt-16 sm:pb-6"
 	bind:this={containerElement}
@@ -863,27 +879,19 @@
 									{/if}
 									<span class="hidden sm:inline">Download</span>
 								</button>
-								{#if canShareTrack}
-									<ShareButton
-										type="track"
-										id={shareTrackId}
-										title="Share track"
-										size={16}
-										iconOnly={false}
-										variant="ghost"
-										buttonClass="player-toggle-button p-1.5 sm:p-2"
-									/>
-								{:else}
-									<button
-										class="player-toggle-button p-1.5 sm:p-2"
-										aria-label="Share track"
-										type="button"
-										disabled
-									>
-										<Share2 size={16} class="sm:w-[18px] sm:h-[18px]" />
-										<span class="hidden sm:inline">Share</span>
-									</button>
-								{/if}
+								<button
+									class="player-toggle-button p-1.5 sm:p-2"
+									aria-label="Share track"
+									type="button"
+									disabled={!canShareTrack}
+									onclick={() => {
+										if (!canShareTrack) return;
+										isShareModalOpen = true;
+									}}
+								>
+									<Share2 size={16} class="sm:w-[18px] sm:h-[18px]" />
+									<span class="hidden sm:inline">Share</span>
+								</button>
 								<button
 									onclick={() => lyricsStore.toggle()}
 									class="player-toggle-button p-1.5 sm:p-2 {$lyricsStore.open
@@ -1411,7 +1419,7 @@
 	}
 
 	/* Player toggle buttons (Lyrics, Queue) */
-	.player-toggle-button {
+	:global(.player-toggle-button) {
 		display: flex;
 		align-items: center;
 		gap: 0.5rem;
@@ -1429,17 +1437,17 @@
 			box-shadow 200ms ease;
 	}
 
-	.player-toggle-button:hover {
+	:global(.player-toggle-button:hover) {
 		border-color: rgba(239, 68, 68, 0.7);
 		color: rgba(255, 255, 255, 0.95);
 	}
 
-	.player-toggle-button:disabled {
+	:global(.player-toggle-button:disabled) {
 		opacity: 0.45;
 		cursor: not-allowed;
 	}
 
-	.player-toggle-button--active {
+	:global(.player-toggle-button--active) {
 		border-color: rgba(239, 68, 68, 0.75);
 		color: rgba(255, 255, 255, 0.98);
 		box-shadow: inset 0 0 20px rgba(239, 68, 68, 0.18);

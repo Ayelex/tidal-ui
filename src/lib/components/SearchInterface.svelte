@@ -31,6 +31,7 @@
 	import { isSonglinkTrack } from '$lib/types';
 	import { libraryStore } from '$lib/stores/library';
 	import { prefetchStreamUrls } from '$lib/utils/streamPrefetch';
+	import ShareButton from '$lib/components/ShareButton.svelte';
 	import {
 		buildSpotifySonglinkTracks,
 		fetchTrackWithRetry,
@@ -60,58 +61,10 @@
 		MoreVertical,
 		List,
 		Play,
-		Shuffle,
-		Copy,
-		Code
+		Shuffle
 	} from 'lucide-svelte';
 
 	import { searchStore } from '$lib/stores/searchStore.svelte';
-
-	function getLongLink(type: 'track' | 'album' | 'artist' | 'playlist', id: string | number) {
-		return `https://riptify.uk/${type}/${id}`;
-	}
-
-	function getShortLink(type: 'track' | 'album' | 'artist' | 'playlist', id: string | number) {
-		const prefixMap = {
-			track: 't',
-			album: 'al',
-			artist: 'ar',
-			playlist: 'p'
-		};
-		return `https://riptify.uk/${prefixMap[type]}/${id}`;
-	}
-
-	function getEmbedCode(type: 'track' | 'album' | 'artist' | 'playlist', id: string | number) {
-		if (type === "track") return `<iframe src="https://riptify.uk/embed/${type}/${id}" width="100%" height="150" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
-		return `<iframe src="https://riptify.uk/embed/${type}/${id}" width="100%" height="450" style="border:none; overflow:hidden; border-radius: 0.5em;" allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"></iframe>`;
-	}
-
-	async function copyToClipboard(text: string) {
-		try {
-			if (navigator.clipboard && navigator.clipboard.writeText) {
-				await navigator.clipboard.writeText(text);
-			} else {
-				// Fallback for non-secure contexts
-				const textArea = document.createElement('textarea');
-				textArea.value = text;
-				textArea.style.position = 'fixed';
-				textArea.style.left = '-9999px';
-				textArea.style.top = '0';
-				document.body.appendChild(textArea);
-				textArea.focus();
-				textArea.select();
-				try {
-					document.execCommand('copy');
-				} catch (err) {
-					console.error('Fallback: Oops, unable to copy', err);
-					throw err;
-				}
-				document.body.removeChild(textArea);
-			}
-		} catch (err) {
-			console.error('Failed to copy:', err);
-		}
-	}
 
 	let downloadingIds = $state(new Set<number | string>());
 	let downloadTaskIds = $state(new Map<number | string, string>());
@@ -1699,6 +1652,26 @@
 										</div>
 										<!-- Queue actions for Songlink tracks -->
 										<div class="flex items-center gap-2 text-sm text-gray-400">
+											{#if track.tidalId}
+												<ShareButton
+													type="track"
+													id={track.tidalId}
+													iconOnly
+													size={18}
+													title="Share track"
+													variant="custom"
+													compact
+													buttonClass="rounded-full p-2 text-gray-400 transition-colors hover:text-white"
+												/>
+											{:else}
+												<button
+													class="rounded-full p-2 text-gray-600"
+													aria-label="Share track"
+													disabled
+												>
+													<Share2 size={18} />
+												</button>
+											{/if}
 											<div class="relative">
 												<button
 													onclick={(event) => {
@@ -1735,40 +1708,6 @@
 														>
 															<ListPlus size={16} />
 															Add to Queue
-														</button>
-														<div class="my-1 border-t border-gray-700"></div>
-														<button
-															onclick={(event) => {
-																event.stopPropagation();
-																copyToClipboard(getLongLink('track', track.id));
-																activeMenuId = null;
-															}}
-															class="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-gray-300 hover:bg-gray-700"
-														>
-															<Link2 size={16} />
-															Share Link
-														</button>
-														<button
-															onclick={(event) => {
-																event.stopPropagation();
-																copyToClipboard(getShortLink('track', track.id));
-																activeMenuId = null;
-															}}
-															class="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-gray-300 hover:bg-gray-700"
-														>
-															<Copy size={16} />
-															Share Short Link
-														</button>
-														<button
-															onclick={(event) => {
-																event.stopPropagation();
-																copyToClipboard(getEmbedCode('track', track.id));
-																activeMenuId = null;
-															}}
-															class="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-gray-300 hover:bg-gray-700"
-														>
-															<Code size={16} />
-															Copy Embed Code
 														</button>
 													</div>
 												{/if}
@@ -1851,6 +1790,16 @@
 												<Download size={18} />
 											{/if}
 										</button>
+										<ShareButton
+											type="track"
+											id={track.id}
+											iconOnly
+											size={18}
+											title="Share track"
+											variant="custom"
+											compact
+											buttonClass="rounded-full p-2 text-gray-400 transition-colors hover:text-white"
+										/>
 										<div class="relative">
 											<button
 												onclick={(event) => {
@@ -1886,40 +1835,6 @@
 													>
 														<ListPlus size={16} />
 														Add to Queue
-													</button>
-													<div class="my-1 border-t border-gray-700"></div>
-													<button
-														onclick={(event) => {
-															event.stopPropagation();
-															copyToClipboard(getLongLink('track', track.id));
-															activeMenuId = null;
-														}}
-														class="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-gray-300 hover:bg-gray-700"
-													>
-														<Link2 size={16} />
-														Share Link
-													</button>
-													<button
-														onclick={(event) => {
-															event.stopPropagation();
-															copyToClipboard(getShortLink('track', track.id));
-															activeMenuId = null;
-														}}
-														class="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-gray-300 hover:bg-gray-700"
-													>
-														<Copy size={16} />
-														Share Short Link
-													</button>
-													<button
-														onclick={(event) => {
-															event.stopPropagation();
-															copyToClipboard(getEmbedCode('track', track.id));
-															activeMenuId = null;
-														}}
-														class="flex w-full items-center gap-2 px-4 py-2 text-left text-sm text-gray-300 hover:bg-gray-700"
-													>
-														<Code size={16} />
-														Copy Embed Code
 													</button>
 												</div>
 											{/if}

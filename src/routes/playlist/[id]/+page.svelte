@@ -148,24 +148,30 @@
 				</div>
 
 				{#if tracks.length > 0}
-					<div class="flex items-center gap-3">
+					<div class="flex flex-wrap items-center gap-3">
 						<button
 							onclick={handlePlayAll}
-							class="flex w-fit items-center gap-2 rounded-full bg-rose-600 px-8 py-3 font-semibold transition-colors hover:bg-rose-700"
+							class="flex w-full items-center justify-center gap-2 rounded-full bg-rose-600 px-8 py-3 font-semibold transition-colors hover:bg-rose-700 sm:w-auto"
 						>
 							<Play size={20} fill="currentColor" />
 							Play All
 						</button>
 						<button
 							onclick={toggleSavePlaylist}
-							class="flex items-center gap-2 rounded-full border border-emerald-400/40 px-6 py-3 text-sm font-semibold text-emerald-200 transition-colors hover:border-emerald-300 hover:text-emerald-100"
+							class="flex w-full items-center justify-center gap-2 rounded-full border border-emerald-400/40 px-6 py-3 text-sm font-semibold text-emerald-200 transition-colors hover:border-emerald-300 hover:text-emerald-100 sm:w-auto"
 							aria-pressed={isSaved}
 							aria-label={isSaved ? 'Remove from saved playlists' : 'Save playlist'}
 						>
 							<Bookmark size={18} fill={isSaved ? 'currentColor' : 'none'} />
 							{isSaved ? 'Saved' : 'Save'}
 						</button>
-						<ShareButton type="playlist" id={playlist.uuid} variant="secondary" />
+						<ShareButton
+							type="playlist"
+							id={playlist.uuid}
+							variant="secondary"
+							fullWidth
+							buttonClass="w-full justify-center px-6 py-3 sm:w-auto"
+						/>
 					</div>
 				{/if}
 			</div>

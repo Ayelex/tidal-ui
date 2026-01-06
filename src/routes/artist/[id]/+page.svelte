@@ -284,11 +284,17 @@ function toggleFavoriteArtist() {
 				<p class="mb-2 text-sm text-gray-400">ARTIST</p>
 				<h1 class="mb-4 text-4xl font-bold md:text-6xl">{artist.name}</h1>
 
-				<div class="mb-6">
-					<ShareButton type="artist" id={artist.id} variant="secondary" />
+				<div class="mb-6 flex flex-wrap items-center gap-3">
+					<ShareButton
+						type="artist"
+						id={artist.id}
+						variant="secondary"
+						fullWidth
+						buttonClass="w-full justify-center px-4 py-2 sm:w-auto"
+					/>
 					<button
 						onclick={toggleFavoriteArtist}
-						class="ml-3 inline-flex items-center gap-2 rounded-full border border-rose-400/40 px-4 py-2 text-sm font-semibold text-rose-200 transition-colors hover:border-rose-300 hover:text-rose-100"
+						class="inline-flex w-full items-center justify-center gap-2 rounded-full border border-rose-400/40 px-4 py-2 text-sm font-semibold text-rose-200 transition-colors hover:border-rose-300 hover:text-rose-100 sm:w-auto"
 						aria-pressed={isLiked}
 						aria-label={isLiked ? 'Remove from liked artists' : 'Add to liked artists'}
 					>

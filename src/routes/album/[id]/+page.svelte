@@ -263,21 +263,21 @@
 					<div class="flex flex-wrap items-center gap-3">
 						<button
 							onclick={handlePlayAll}
-							class="flex items-center gap-2 rounded-full bg-rose-600 px-8 py-3 font-semibold transition-colors hover:bg-rose-700"
+							class="flex w-full items-center justify-center gap-2 rounded-full bg-rose-600 px-8 py-3 font-semibold transition-colors hover:bg-rose-700 sm:w-auto"
 						>
 							<Play size={20} fill="currentColor" />
 							Play All
 						</button>
 						<button
 							onclick={handleShufflePlay}
-							class="flex items-center gap-2 rounded-full border border-purple-400/50 px-6 py-3 text-sm font-semibold text-purple-200 transition-colors hover:border-purple-300 hover:text-purple-100"
+							class="flex w-full items-center justify-center gap-2 rounded-full border border-purple-400/50 px-6 py-3 text-sm font-semibold text-purple-200 transition-colors hover:border-purple-300 hover:text-purple-100 sm:w-auto"
 						>
 							<Shuffle size={18} />
 							Shuffle Play
 						</button>
 						<button
 							onclick={handleDownloadAll}
-							class="flex items-center gap-2 rounded-full border border-rose-400/40 px-6 py-3 text-sm font-semibold text-rose-300 transition-colors hover:border-rose-400 hover:text-rose-200 disabled:cursor-not-allowed disabled:opacity-60"
+							class="flex w-full items-center justify-center gap-2 rounded-full border border-rose-400/40 px-6 py-3 text-sm font-semibold text-rose-300 transition-colors hover:border-rose-400 hover:text-rose-200 disabled:cursor-not-allowed disabled:opacity-60 sm:w-auto"
 							disabled={isDownloadingAll}
 						>
 							<Download size={18} />
@@ -287,14 +287,20 @@
 						</button>
 						<button
 							onclick={toggleSaveAlbum}
-							class="flex items-center gap-2 rounded-full border border-emerald-400/40 px-6 py-3 text-sm font-semibold text-emerald-200 transition-colors hover:border-emerald-300 hover:text-emerald-100"
+							class="flex w-full items-center justify-center gap-2 rounded-full border border-emerald-400/40 px-6 py-3 text-sm font-semibold text-emerald-200 transition-colors hover:border-emerald-300 hover:text-emerald-100 sm:w-auto"
 							aria-pressed={isSaved}
 							aria-label={isSaved ? 'Remove from saved albums' : 'Save album'}
 						>
 							<Bookmark size={18} fill={isSaved ? 'currentColor' : 'none'} />
 							{isSaved ? 'Saved' : 'Save'}
 						</button>
-						<ShareButton type="album" id={album.id} variant="secondary" />
+						<ShareButton
+							type="album"
+							id={album.id}
+							variant="secondary"
+							fullWidth
+							buttonClass="w-full justify-center px-6 py-3 sm:w-auto"
+						/>
 					</div>
 					{#if downloadError}
 						<p class="mt-2 text-sm text-red-400">{downloadError}</p>
