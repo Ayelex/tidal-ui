@@ -6,8 +6,6 @@ export const ssr = false;
 export const load = () => {
 	return {
 		title: env.PUBLIC_TITLE || 'Riptify',
-		slogan:
-			env.PUBLIC_SLOGAN ||
-			"Ayelex's Music Streaming Service. Enjoy lossless audio and download whatever you want for free!"
+		slogan: env.PUBLIC_SLOGAN || 'Ayelexs Music Streaming Service. Enjoy lossless audio and download whatever you want for free!'
 	};
 };

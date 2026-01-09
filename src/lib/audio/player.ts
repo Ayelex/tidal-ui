@@ -9,6 +9,7 @@ import type { AudioQuality, PlayableTrack, SonglinkTrack, Track } from '$lib/typ
 import { isSonglinkTrack } from '$lib/types';
 import { audioReducer, type AudioState, type PlaybackStatus, type RepeatMode } from './state';
 import { audioTelemetry } from './telemetry';
+import { streamCache } from './streamCache';
 import { createMediaSessionBridge } from './mediaSession';
 import { createAudioElement, MockAudioElement, type AudioElementLike } from './mockAudio';
 
@@ -39,9 +40,34 @@ type LoadOptions = {
 	resetTime?: boolean;
 };
 
+type LoadOutcome = 'playing' | 'ready' | 'blocked' | 'error' | 'timeout' | 'stalled' | 'canceled';
+
+type StreamCandidate = {
+	url: string;
+	quality: AudioQuality;
+	source: 'cache' | 'api';
+	replayGain: number | null;
+	sampleRate: number | null;
+	bitDepth: number | null;
+	resolvedAt: number;
+};
+
+type ActiveStreamMeta = StreamCandidate & {
+	trackId: number;
+};
+
 const hiResQualities = new Set<AudioQuality>(['HI_RES_LOSSLESS']);
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+
+const LOAD_ATTEMPT_LIMIT = 3;
+const LOAD_TIMEOUT_MS = 12000;
+const READY_TIMEOUT_MS = 8000;
+const STALL_TIMEOUT_MS = 5000;
+const RETRY_BACKOFF_MS = [0, 500, 1500];
+const PREFETCH_GUARD_MS = 15000;
+const PROBE_TIMEOUT_MS = 5000;
+const PREFETCH_RANGE_BYTES = 65535;
 
 const SILENT_AUDIO_DATA_URI =
 	'data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YSADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==';
@@ -101,6 +127,7 @@ export class AudioController {
 	private dashObjectUrl: string | null = null;
 	private loadToken = 0;
 	private pendingPlay = false;
+	private playInFlight = false;
 	private pendingSeek: number | null = null;
 	private lastTimeUpdateAt = 0;
 	private lastPositionUpdateAt = 0;
@@ -116,6 +143,22 @@ export class AudioController {
 	private activeSrc: string | null = null;
 	private commandQueue: Promise<void> = Promise.resolve();
 	private commandId = 0;
+	private loadOutcome: Promise<LoadOutcome> | null = null;
+	private resolveLoadOutcome: ((outcome: LoadOutcome) => void) | null = null;
+	private loadOutcomeToken = 0;
+	private loadExpectPlay = false;
+	private loadStartedAt = 0;
+	private loadTimeoutId: ReturnType<typeof setTimeout> | null = null;
+	private stallTimeoutId: ReturnType<typeof setTimeout> | null = null;
+	private lastProgressAt = 0;
+	private retryCount = 0;
+	private lastRetryAt = 0;
+	private activeStreamMeta: ActiveStreamMeta | null = null;
+	private prefetchAbort: AbortController | null = null;
+	private prefetching = false;
+	private lastPrefetchAt = 0;
+	private lastPrefetchTrackId: number | null = null;
+	private activeProbeController: AbortController | null = null;
 	private mediaSession = createMediaSessionBridge({
 		onPlay: () => this.play('media-session'),
 		onPause: () => this.pause('media-session'),
@@ -151,6 +194,13 @@ export class AudioController {
 		this.attachListeners();
 		this.applyVolume();
 		audioTelemetry.logState('init', this.state);
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('audio-init', createSnapshot(this.state, this.audio), {
+				crossOrigin: this.audio.crossOrigin,
+				preload: this.audio.preload,
+				autoplay: this.audio.autoplay
+			});
+		}
 	}
 	subscribe = (listener: (state: AudioState) => void) => {
 		listener(this.state);
@@ -264,6 +314,116 @@ export class AudioController {
 		}
 	}
 
+	private clearLoadTimers() {
+		if (this.loadTimeoutId) {
+			clearTimeout(this.loadTimeoutId);
+			this.loadTimeoutId = null;
+		}
+		if (this.stallTimeoutId) {
+			clearTimeout(this.stallTimeoutId);
+			this.stallTimeoutId = null;
+		}
+		if (this.activeProbeController) {
+			this.activeProbeController.abort();
+			this.activeProbeController = null;
+		}
+	}
+
+	private startLoadOutcome(token: number, expectPlay: boolean, timeoutMs: number) {
+		this.cancelLoadOutcome('new-load');
+		this.loadOutcomeToken = token;
+		this.loadExpectPlay = expectPlay;
+		this.loadStartedAt =
+			typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+		this.lastProgressAt = Date.now();
+		this.loadOutcome = new Promise((resolve) => {
+			this.resolveLoadOutcome = resolve;
+		});
+		this.clearLoadTimers();
+		this.loadTimeoutId = setTimeout(() => {
+			this.resolveLoadOutcomeIfPending('timeout', { timeoutMs });
+		}, timeoutMs);
+	}
+
+	private resolveLoadOutcomeIfPending(outcome: LoadOutcome, detail?: Record<string, unknown>) {
+		if (!this.resolveLoadOutcome) {
+			return;
+		}
+		if (this.loadOutcomeToken !== this.loadToken) {
+			return;
+		}
+		if (outcome !== 'playing') {
+			this.loadStartedAt = 0;
+		}
+		const resolve = this.resolveLoadOutcome;
+		this.resolveLoadOutcome = null;
+		this.clearLoadTimers();
+		resolve(outcome);
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('load-outcome', createSnapshot(this.state, this.audio), {
+				outcome,
+				...detail
+			});
+		}
+	}
+
+	private cancelLoadOutcome(reason: string) {
+		if (!this.resolveLoadOutcome) {
+			return;
+		}
+		const resolve = this.resolveLoadOutcome;
+		this.resolveLoadOutcome = null;
+		this.clearLoadTimers();
+		this.loadStartedAt = 0;
+		resolve('canceled');
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('load-outcome', createSnapshot(this.state, this.audio), {
+				outcome: 'canceled',
+				reason
+			});
+		}
+	}
+
+	private async waitForLoadOutcome(token: number): Promise<LoadOutcome> {
+		if (!this.loadOutcome || this.loadOutcomeToken !== token) {
+			return 'canceled';
+		}
+		try {
+			return await this.loadOutcome;
+		} catch {
+			return 'error';
+		}
+	}
+
+	private markProgress() {
+		this.lastProgressAt = Date.now();
+		if (this.stallTimeoutId) {
+			clearTimeout(this.stallTimeoutId);
+			this.stallTimeoutId = null;
+		}
+	}
+
+	private isLoadPending() {
+		return Boolean(this.resolveLoadOutcome && this.loadOutcomeToken === this.loadToken);
+	}
+
+	private scheduleStallRecovery(reason: string) {
+		if (this.stallTimeoutId) {
+			return;
+		}
+		this.stallTimeoutId = setTimeout(() => {
+			this.stallTimeoutId = null;
+			const stalledFor = Date.now() - this.lastProgressAt;
+			if (stalledFor < STALL_TIMEOUT_MS) {
+				return;
+			}
+			this.resolveLoadOutcomeIfPending('stalled', { reason, stalledForMs: stalledFor });
+			if (!this.isLoadPending() && this.state.status === 'buffering') {
+				void this.retryCurrentTrack();
+			}
+		}, STALL_TIMEOUT_MS);
+	}
+
 	private canTransition(from: PlaybackStatus, to: PlaybackStatus): boolean {
 		if (from === to) {
 			return true;
@@ -301,15 +461,18 @@ export class AudioController {
 	}
 
 	private attachListeners() {
+		this.audio.addEventListener('loadstart', this.handleLoadStart);
 		this.audio.addEventListener('timeupdate', this.handleTimeUpdate);
 		this.audio.addEventListener('loadedmetadata', this.handleLoadedMetadata);
 		this.audio.addEventListener('loadeddata', this.handleLoadedData);
 		this.audio.addEventListener('durationchange', this.handleDurationChange);
 		this.audio.addEventListener('progress', this.handleProgress);
 		this.audio.addEventListener('canplay', this.handleCanPlay);
+		this.audio.addEventListener('canplaythrough', this.handleCanPlayThrough);
 		this.audio.addEventListener('playing', this.handlePlaying);
 		this.audio.addEventListener('play', this.handlePlay);
 		this.audio.addEventListener('pause', this.handlePause);
+		this.audio.addEventListener('abort', this.handleAbort);
 		this.audio.addEventListener('waiting', this.handleWaiting);
 		this.audio.addEventListener('stalled', this.handleStalled);
 		this.audio.addEventListener('ended', this.handleEnded);
@@ -319,15 +482,18 @@ export class AudioController {
 	}
 
 	private detachListeners() {
+		this.audio.removeEventListener('loadstart', this.handleLoadStart);
 		this.audio.removeEventListener('timeupdate', this.handleTimeUpdate);
 		this.audio.removeEventListener('loadedmetadata', this.handleLoadedMetadata);
 		this.audio.removeEventListener('loadeddata', this.handleLoadedData);
 		this.audio.removeEventListener('durationchange', this.handleDurationChange);
 		this.audio.removeEventListener('progress', this.handleProgress);
 		this.audio.removeEventListener('canplay', this.handleCanPlay);
+		this.audio.removeEventListener('canplaythrough', this.handleCanPlayThrough);
 		this.audio.removeEventListener('playing', this.handlePlaying);
 		this.audio.removeEventListener('play', this.handlePlay);
 		this.audio.removeEventListener('pause', this.handlePause);
+		this.audio.removeEventListener('abort', this.handleAbort);
 		this.audio.removeEventListener('waiting', this.handleWaiting);
 		this.audio.removeEventListener('stalled', this.handleStalled);
 		this.audio.removeEventListener('ended', this.handleEnded);
@@ -352,6 +518,16 @@ export class AudioController {
 		return false;
 	}
 
+	private handleLoadStart = () => {
+		if (this.shouldIgnoreEvent()) {
+			return;
+		}
+		this.markProgress();
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('loadstart', createSnapshot(this.state, this.audio));
+		}
+	};
+
 	private handleTimeUpdate = () => {
 		if (this.shouldIgnoreEvent()) {
 			return;
@@ -368,6 +544,7 @@ export class AudioController {
 		if (this.pendingSeek !== null) {
 			return;
 		}
+		this.markProgress();
 		const currentTime = this.audio.currentTime ?? 0;
 		if (Number.isFinite(currentTime)) {
 			this.dispatch({ type: 'SET_TIME', currentTime });
@@ -379,10 +556,21 @@ export class AudioController {
 		}
 	};
 
+	private handleCanPlayThrough = () => {
+		if (this.shouldIgnoreEvent()) {
+			return;
+		}
+		this.markProgress();
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('canplaythrough', createSnapshot(this.state, this.audio));
+		}
+	};
+
 	private handleLoadedMetadata = () => {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
+		this.markProgress();
 		this.syncDuration();
 		this.applyPendingSeek();
 		if (audioTelemetry.enabled) {
@@ -394,9 +582,13 @@ export class AudioController {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
+		this.markProgress();
 		this.syncDuration();
 		this.applyPendingSeek();
 		this.setStatus(this.state.isPlaying ? 'playing' : 'paused', 'loadeddata');
+		if (!this.loadExpectPlay) {
+			this.resolveLoadOutcomeIfPending('ready', { event: 'loadeddata' });
+		}
 		if (audioTelemetry.enabled) {
 			audioTelemetry.logEvent('loadeddata', createSnapshot(this.state, this.audio));
 		}
@@ -406,6 +598,7 @@ export class AudioController {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
+		this.markProgress();
 		this.syncDuration();
 		this.updateBufferedPercent();
 		if (audioTelemetry.enabled) {
@@ -417,6 +610,7 @@ export class AudioController {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
+		this.markProgress();
 		this.updateBufferedPercent();
 	};
 
@@ -424,10 +618,14 @@ export class AudioController {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
+		this.markProgress();
 		if (this.pendingPlay) {
 			this.setStatus('buffering', 'canplay');
 		} else if (this.state.status === 'loading') {
 			this.setStatus('paused', 'canplay');
+		}
+		if (!this.loadExpectPlay) {
+			this.resolveLoadOutcomeIfPending('ready', { event: 'canplay' });
 		}
 		this.tryAutoPlay('canplay');
 		if (audioTelemetry.enabled) {
@@ -439,11 +637,50 @@ export class AudioController {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
+		this.markProgress();
 		this.setStatus('playing', 'playing');
 		this.dispatch({ type: 'SET_NEEDS_GESTURE', needsGesture: false });
-		if (audioTelemetry.enabled) {
-			audioTelemetry.logEvent('playing', createSnapshot(this.state, this.audio));
+		this.retryCount = 0;
+		let latencyMs: number | null = null;
+		if (this.loadStartedAt > 0) {
+			const now =
+				typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+			latencyMs = Math.max(0, Math.round(now - this.loadStartedAt));
+			this.loadStartedAt = 0;
 		}
+		if (latencyMs !== null) {
+			audioTelemetry.recordPlaybackStart(latencyMs);
+		}
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('playing', createSnapshot(this.state, this.audio), {
+				startupLatencyMs: latencyMs ?? undefined
+			});
+		}
+		this.resolveLoadOutcomeIfPending('playing', { event: 'playing' });
+		const currentTrack = this.state.currentTrack;
+		if (
+			currentTrack &&
+			this.activeStreamMeta &&
+			this.activeStreamMeta.trackId === currentTrack.id
+		) {
+			streamCache.setValidated({
+				trackId: currentTrack.id,
+				quality: this.activeStreamMeta.quality,
+				url: this.activeStreamMeta.url,
+				replayGain: this.activeStreamMeta.replayGain,
+				sampleRate: this.activeStreamMeta.sampleRate,
+				bitDepth: this.activeStreamMeta.bitDepth,
+				fetchedAt: this.activeStreamMeta.resolvedAt
+			});
+			if (audioTelemetry.enabled) {
+				audioTelemetry.logEvent('stream-cache-write', createSnapshot(this.state, this.audio), {
+					trackId: currentTrack.id,
+					quality: this.activeStreamMeta.quality,
+					source: this.activeStreamMeta.source
+				});
+			}
+		}
+		void this.prefetchNextTrack('playing');
 		this.updateMediaSessionPlaybackState();
 	};
 
@@ -473,12 +710,25 @@ export class AudioController {
 		}
 	};
 
+	private handleAbort = () => {
+		if (this.shouldIgnoreEvent()) {
+			return;
+		}
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('abort', createSnapshot(this.state, this.audio));
+		}
+	};
+
 	private handleWaiting = () => {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
 		this.setStatus('buffering', 'waiting');
+		this.scheduleStallRecovery('waiting');
 		this.updateMediaSessionPlaybackState();
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('waiting', createSnapshot(this.state, this.audio));
+		}
 	};
 
 	private handleStalled = () => {
@@ -486,7 +736,11 @@ export class AudioController {
 			return;
 		}
 		this.setStatus('buffering', 'stalled');
+		this.scheduleStallRecovery('stalled');
 		this.updateMediaSessionPlaybackState();
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('stalled', createSnapshot(this.state, this.audio));
+		}
 	};
 
 	private handleEnded = () => {
@@ -517,6 +771,7 @@ export class AudioController {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
+		this.markProgress();
 		this.pendingSeek = null;
 		const currentTime = this.audio.currentTime ?? 0;
 		if (Number.isFinite(currentTime)) {
@@ -533,16 +788,31 @@ export class AudioController {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
+		const errorCode = this.audio.error?.code;
 		if (audioTelemetry.enabled) {
-			audioTelemetry.logEvent('error', createSnapshot(this.state, this.audio));
+			audioTelemetry.logEvent('error', createSnapshot(this.state, this.audio), {
+				errorCode
+			});
 		}
 		const message = 'Playback error';
 		this.dispatch({ type: 'SET_ERROR', error: message });
 		this.setStatus('error', 'error');
 		this.updateMediaSessionPlaybackState();
-		if (this.state.currentTrack && !isSonglinkTrack(this.state.currentTrack)) {
-			void this.retryCurrentTrack();
+		audioTelemetry.recordPlaybackFailure();
+		const current = this.state.currentTrack;
+		if (current && !isSonglinkTrack(current)) {
+			if (this.activeStreamMeta && this.activeStreamMeta.trackId === current.id) {
+				streamCache.recordFailure(current.id, this.activeStreamMeta.quality);
+				if (this.activeStreamMeta.source === 'cache') {
+					streamCache.invalidate(current.id, this.activeStreamMeta.quality);
+				}
+				losslessAPI.invalidateStreamDataCache(current.id, this.activeStreamMeta.quality);
+			}
+			if (!this.isLoadPending()) {
+				void this.retryCurrentTrack();
+			}
 		}
+		this.resolveLoadOutcomeIfPending('error', { errorCode });
 	};
 	private updateBufferedPercent() {
 		const duration = this.audio.duration;
@@ -736,6 +1006,229 @@ export class AudioController {
 		}
 		return this.state.quality;
 	}
+
+	private async resolveStreamCandidate(
+		track: Track,
+		quality: AudioQuality,
+		options: { allowCache: boolean; attempt: number }
+	): Promise<StreamCandidate | null> {
+		const snapshot = createSnapshot(this.state, this.audio);
+		if (options.allowCache) {
+			const cached = streamCache.get(track.id, quality);
+			if (cached) {
+				audioTelemetry.recordCacheHit();
+				if (audioTelemetry.enabled) {
+					audioTelemetry.logEvent('resolve-cache-hit', snapshot, {
+						trackId: track.id,
+						quality,
+						ageMs: Math.max(0, Date.now() - cached.validatedAt),
+						attempt: options.attempt
+					});
+				}
+				return {
+					url: cached.url,
+					quality,
+					source: 'cache',
+					replayGain: cached.replayGain ?? null,
+					sampleRate: cached.sampleRate ?? null,
+					bitDepth: cached.bitDepth ?? null,
+					resolvedAt: cached.validatedAt
+				};
+			}
+			audioTelemetry.recordCacheMiss();
+			if (audioTelemetry.enabled) {
+				audioTelemetry.logEvent('resolve-cache-miss', snapshot, {
+					trackId: track.id,
+					quality,
+					attempt: options.attempt
+				});
+			}
+		}
+
+		const start = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+		audioTelemetry.recordResolveAttempt();
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('resolve-start', snapshot, {
+				trackId: track.id,
+				quality,
+				attempt: options.attempt
+			});
+		}
+
+		try {
+			const data = await losslessAPI.getStreamData(track.id, quality);
+			const end = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+			const latencyMs = Math.max(0, Math.round(end - start));
+			audioTelemetry.recordResolveSuccess(latencyMs);
+			if (audioTelemetry.enabled) {
+				audioTelemetry.logEvent('resolve-success', snapshot, {
+					trackId: track.id,
+					quality,
+					latencyMs
+				});
+			}
+			return {
+				url: data.url,
+				quality,
+				source: 'api',
+				replayGain: data.replayGain ?? null,
+				sampleRate: data.sampleRate ?? null,
+				bitDepth: data.bitDepth ?? null,
+				resolvedAt: Date.now()
+			};
+		} catch (error) {
+			audioTelemetry.recordResolveFailure();
+			if (audioTelemetry.enabled) {
+				audioTelemetry.logEvent('resolve-failure', snapshot, {
+					trackId: track.id,
+					quality,
+					attempt: options.attempt,
+					message: error instanceof Error ? error.message : String(error)
+				});
+			}
+			return null;
+		}
+	}
+
+	private async applyStreamCandidate(track: Track, candidate: StreamCandidate, token: number) {
+		await this.destroyShakaPlayer();
+		if (this.useMock) {
+			this.audio.src = `mock://track/${track.id}?q=${candidate.quality}`;
+			this.activeSrc = this.audio.src;
+			this.activeStreamMeta = null;
+			(this.audio as MockAudioElement).setMockDuration(track.duration ?? 120);
+			this.audio.load();
+			this.dispatch({ type: 'SET_ACTIVE_QUALITY', activeQuality: candidate.quality });
+			this.dispatch({
+				type: 'SET_METADATA',
+				sampleRate: null,
+				bitDepth: null,
+				replayGain: null
+			});
+			this.applyVolume();
+			return;
+		}
+		if (token !== this.loadToken) {
+			return;
+		}
+		const url = getProxiedUrl(candidate.url);
+		this.activeStreamMeta = { ...candidate, trackId: track.id };
+		this.audio.src = url;
+		this.activeSrc = this.audio.src;
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('stream-src', createSnapshot(this.state, this.audio), {
+				trackId: track.id,
+				quality: candidate.quality,
+				source: candidate.source,
+				url: candidate.url,
+				proxiedUrl: url
+			});
+		}
+		this.audio.load();
+		this.dispatch({ type: 'SET_ACTIVE_QUALITY', activeQuality: candidate.quality });
+		this.dispatch({
+			type: 'SET_METADATA',
+			sampleRate: candidate.sampleRate ?? null,
+			bitDepth: candidate.bitDepth ?? null,
+			replayGain: candidate.replayGain ?? null
+		});
+		this.applyVolume();
+	}
+
+	private async loadStandardTrackWithRetries(
+		track: Track,
+		quality: AudioQuality,
+		token: number
+	): Promise<LoadOutcome> {
+		if (this.useMock) {
+			const candidate: StreamCandidate = {
+				url: `mock://track/${track.id}?q=${quality}`,
+				quality,
+				source: 'api',
+				replayGain: null,
+				sampleRate: null,
+				bitDepth: null,
+				resolvedAt: Date.now()
+			};
+			this.startLoadOutcome(token, this.pendingPlay, this.pendingPlay ? LOAD_TIMEOUT_MS : READY_TIMEOUT_MS);
+			await this.applyStreamCandidate(track, candidate, token);
+			if (token !== this.loadToken) {
+				return 'canceled';
+			}
+			if (this.pendingPlay) {
+				void this.attemptPlay('load-track');
+			}
+			return this.waitForLoadOutcome(token);
+		}
+		let lastOutcome: LoadOutcome = 'error';
+		for (let attempt = 1; attempt <= LOAD_ATTEMPT_LIMIT; attempt += 1) {
+			if (token !== this.loadToken) {
+				return 'canceled';
+			}
+			const allowCache = attempt === 1;
+			const candidate = await this.resolveStreamCandidate(track, quality, {
+				allowCache,
+				attempt
+			});
+			if (!candidate) {
+				lastOutcome = 'error';
+				continue;
+			}
+			if (audioTelemetry.enabled) {
+				audioTelemetry.logEvent('stream-candidate', createSnapshot(this.state, this.audio), {
+					trackId: track.id,
+					quality: candidate.quality,
+					source: candidate.source,
+					attempt
+				});
+			}
+			void this.probeStreamUrl(candidate, token, attempt);
+			this.startLoadOutcome(token, this.pendingPlay, this.pendingPlay ? LOAD_TIMEOUT_MS : READY_TIMEOUT_MS);
+			await this.applyStreamCandidate(track, candidate, token);
+			if (token !== this.loadToken) {
+				return 'canceled';
+			}
+			if (this.pendingPlay) {
+				void this.attemptPlay('load-track');
+			}
+			const outcome = await this.waitForLoadOutcome(token);
+			if (outcome === 'playing' || outcome === 'ready' || outcome === 'blocked') {
+				return outcome;
+			}
+			if (outcome === 'canceled') {
+				return outcome;
+			}
+			if (outcome === 'timeout' || outcome === 'stalled') {
+				audioTelemetry.recordPlaybackFailure();
+			}
+			lastOutcome = outcome;
+			streamCache.recordFailure(track.id, quality);
+			if (candidate.source === 'cache') {
+				streamCache.invalidate(track.id, quality);
+			}
+			losslessAPI.invalidateStreamDataCache(track.id, quality);
+			if (attempt < LOAD_ATTEMPT_LIMIT) {
+				const delayMs = RETRY_BACKOFF_MS[Math.min(attempt - 1, RETRY_BACKOFF_MS.length - 1)] ?? 0;
+				if (delayMs > 0) {
+					await new Promise((resolve) => setTimeout(resolve, delayMs));
+				}
+			}
+		}
+		return lastOutcome;
+	}
+
+	private async loadDashTrackWithOutcome(track: Track, token: number): Promise<LoadOutcome> {
+		this.activeStreamMeta = null;
+		this.startLoadOutcome(token, this.pendingPlay, this.pendingPlay ? LOAD_TIMEOUT_MS : READY_TIMEOUT_MS);
+		await this.loadDashTrack(track, token);
+		if (token !== this.loadToken) {
+			return 'canceled';
+		}
+		if (this.pendingPlay) {
+			void this.attemptPlay('load-dash');
+		}
+		return this.waitForLoadOutcome(token);
+	}
 	private async loadTrack(track: PlayableTrack, options?: LoadOptions) {
 		if (this.destroyed) {
 			return;
@@ -743,6 +1236,14 @@ export class AudioController {
 		const token = ++this.loadToken;
 		this.endedToken = -1;
 		this.activeSrc = null;
+		this.activeStreamMeta = null;
+		this.cancelLoadOutcome('track-change');
+		this.clearLoadTimers();
+		if (this.prefetchAbort) {
+			this.prefetchAbort.abort();
+			this.prefetchAbort = null;
+			this.prefetching = false;
+		}
 		const resumeTime =
 			typeof options?.resumeTime === 'number' && options.resumeTime > 0
 				? options.resumeTime
@@ -793,10 +1294,13 @@ export class AudioController {
 		}
 		const quality = this.resolveQuality(resolvedTrack as Track);
 		const effectiveQuality = this.normalizeQuality(resolvedTrack as Track, quality);
+		const isSuccess = (outcome: LoadOutcome | null) =>
+			outcome === 'playing' || outcome === 'ready' || outcome === 'blocked';
+		let outcome: LoadOutcome | null = null;
 		try {
 			if (hiResQualities.has(effectiveQuality)) {
 				try {
-					await this.loadDashTrack(resolvedTrack as Track, token);
+					outcome = await this.loadDashTrackWithOutcome(resolvedTrack as Track, token);
 				} catch (error) {
 					if (token !== this.loadToken) {
 						return;
@@ -804,20 +1308,18 @@ export class AudioController {
 					if (dev) {
 						console.warn('DASH load failed, falling back to lossless', error);
 					}
-					await this.loadStandardTrack(resolvedTrack as Track, 'LOSSLESS', token);
+				}
+				if (!isSuccess(outcome)) {
+					outcome = await this.loadStandardTrackWithRetries(resolvedTrack as Track, 'LOSSLESS', token);
 				}
 			} else {
-				try {
-					await this.loadStandardTrack(resolvedTrack as Track, effectiveQuality, token);
-				} catch (error) {
-					if (token !== this.loadToken) {
-						return;
-					}
-					if (effectiveQuality !== 'LOSSLESS') {
-						await this.loadStandardTrack(resolvedTrack as Track, 'LOSSLESS', token);
-					} else {
-						throw error;
-					}
+				outcome = await this.loadStandardTrackWithRetries(
+					resolvedTrack as Track,
+					effectiveQuality,
+					token
+				);
+				if (!isSuccess(outcome) && effectiveQuality !== 'LOSSLESS') {
+					outcome = await this.loadStandardTrackWithRetries(resolvedTrack as Track, 'LOSSLESS', token);
 				}
 			}
 			if (
@@ -828,15 +1330,23 @@ export class AudioController {
 			) {
 				this.pendingSeek = options.resumeTime;
 			}
+			if (outcome === 'canceled') {
+				return;
+			}
+			if (!isSuccess(outcome)) {
+				throw new Error('Unable to load stream');
+			}
 		} catch (error) {
 			if (token !== this.loadToken) {
 				return;
 			}
+			audioTelemetry.recordPlaybackFailure();
 			this.dispatch({
 				type: 'SET_ERROR',
 				error: error instanceof Error ? error.message : 'Unable to load stream'
 			});
 			this.setStatus('error', 'load-failed');
+			this.pendingPlay = false;
 		}
 		this.updateMediaSessionMetadata();
 		this.updateMediaSessionPlaybackState();
@@ -851,53 +1361,16 @@ export class AudioController {
 		return requested;
 	}
 
-	private async loadStandardTrack(track: Track, quality: AudioQuality, token: number) {
-		await this.destroyShakaPlayer();
-		if (this.useMock) {
-			this.audio.src = `mock://track/${track.id}?q=${quality}`;
-			this.activeSrc = this.audio.src;
-			(this.audio as MockAudioElement).setMockDuration(track.duration ?? 120);
-			this.audio.load();
-			this.dispatch({ type: 'SET_ACTIVE_QUALITY', activeQuality: quality });
-			this.dispatch({
-				type: 'SET_METADATA',
-				sampleRate: null,
-				bitDepth: null,
-				replayGain: null
-			});
-			this.applyVolume();
-			return;
-		}
-		const data = await losslessAPI.getStreamData(track.id, quality);
-		if (token !== this.loadToken) {
-			return;
-		}
-		const url = getProxiedUrl(data.url);
-		this.audio.src = url;
-		this.activeSrc = this.audio.src;
-		this.audio.load();
-		this.dispatch({ type: 'SET_ACTIVE_QUALITY', activeQuality: quality });
-		this.dispatch({
-			type: 'SET_METADATA',
-			sampleRate: data.sampleRate ?? null,
-			bitDepth: data.bitDepth ?? null,
-			replayGain: data.replayGain ?? null
-		});
-		this.applyVolume();
-	}
-
 	private async loadDashTrack(track: Track, token: number) {
 		if (!this.realAudio || this.useMock) {
-			await this.loadStandardTrack(track, 'LOSSLESS', token);
-			return;
+			throw new Error('DASH playback unavailable for this environment');
 		}
 		const manifest = await losslessAPI.getDashManifestWithMetadata(track.id, 'HI_RES_LOSSLESS');
 		if (token !== this.loadToken) {
 			return;
 		}
 		if (manifest.result.kind === 'flac') {
-			await this.loadStandardTrack(track, 'LOSSLESS', token);
-			return;
+			throw new Error('DASH manifest returned direct stream');
 		}
 		this.revokeDashObjectUrl();
 		const blob = new Blob([manifest.result.manifest], {
@@ -922,10 +1395,243 @@ export class AudioController {
 		this.applyVolume();
 	}
 
+	private async probeStreamUrl(candidate: StreamCandidate, token: number, attempt: number) {
+		if (!audioTelemetry.enabled || this.useMock) {
+			return;
+		}
+		if (token !== this.loadToken) {
+			return;
+		}
+		if (this.activeProbeController) {
+			this.activeProbeController.abort();
+		}
+		const controller = new AbortController();
+		this.activeProbeController = controller;
+		const probeUrl = getProxiedUrl(candidate.url);
+		const startedAt =
+			typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+		const timeoutId = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+		try {
+			const response = await fetch(probeUrl, {
+				method: 'GET',
+				headers: {
+					Range: `bytes=0-${PREFETCH_RANGE_BYTES}`
+				},
+				signal: controller.signal
+			});
+			const endedAt =
+				typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+			const latencyMs = Math.max(0, Math.round(endedAt - startedAt));
+			const contentType = response.headers.get('content-type');
+			const acceptRanges = response.headers.get('accept-ranges');
+			const contentRange = response.headers.get('content-range');
+			void response.body?.cancel?.();
+			audioTelemetry.logEvent('stream-probe', createSnapshot(this.state, this.audio), {
+				trackId: this.state.currentTrack?.id ?? null,
+				quality: candidate.quality,
+				source: candidate.source,
+				attempt,
+				status: response.status,
+				latencyMs,
+				contentType,
+				acceptRanges,
+				contentRange,
+				redirected: response.redirected,
+				finalUrl: response.url
+			});
+		} catch (error) {
+			const endedAt =
+				typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+			const latencyMs = Math.max(0, Math.round(endedAt - startedAt));
+			audioTelemetry.logEvent('stream-probe-failure', createSnapshot(this.state, this.audio), {
+				trackId: this.state.currentTrack?.id ?? null,
+				quality: candidate.quality,
+				source: candidate.source,
+				attempt,
+				latencyMs,
+				message: error instanceof Error ? error.message : String(error)
+			});
+		} finally {
+			clearTimeout(timeoutId);
+			if (this.activeProbeController === controller) {
+				this.activeProbeController = null;
+			}
+		}
+	}
+
+	private shouldPrefetch(): boolean {
+		if (this.prefetching) {
+			return false;
+		}
+		const now = Date.now();
+		if (now - this.lastPrefetchAt < PREFETCH_GUARD_MS) {
+			return false;
+		}
+		if (typeof navigator === 'undefined') {
+			return false;
+		}
+		const connection = (navigator as Navigator & {
+			connection?: { saveData?: boolean; effectiveType?: string };
+		}).connection;
+		if (connection?.saveData) {
+			return false;
+		}
+		if (connection?.effectiveType && ['slow-2g', '2g'].includes(connection.effectiveType)) {
+			return false;
+		}
+		return true;
+	}
+
+	private getNextIndexForPrefetch(): number | null {
+		const { queue, queueIndex, repeatMode, shuffleEnabled } = this.state;
+		if (queue.length <= 1) {
+			return null;
+		}
+		const allowWrap = repeatMode === 'all';
+		if (!shuffleEnabled) {
+			if (queueIndex < queue.length - 1) {
+				return queueIndex + 1;
+			}
+			return allowWrap ? 0 : null;
+		}
+		if (this.shuffleBag.length > 0) {
+			return this.shuffleBag[0] ?? null;
+		}
+		return null;
+	}
+
+	private async warmStreamUrl(
+		url: string,
+		signal: AbortSignal,
+		trackId: number,
+		quality: AudioQuality
+	) {
+		const start = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+		try {
+			const response = await fetch(url, {
+				method: 'GET',
+				headers: {
+					Range: `bytes=0-${PREFETCH_RANGE_BYTES}`
+				},
+				signal
+			});
+			void response.body?.cancel?.();
+			if (audioTelemetry.enabled) {
+				const end =
+					typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+				audioTelemetry.logEvent('prefetch-warm', createSnapshot(this.state, this.audio), {
+					trackId,
+					quality,
+					status: response.status,
+					latencyMs: Math.max(0, Math.round(end - start))
+				});
+			}
+		} catch (error) {
+			if (audioTelemetry.enabled) {
+				const end =
+					typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+				audioTelemetry.logEvent('prefetch-warm-failure', createSnapshot(this.state, this.audio), {
+					trackId,
+					quality,
+					latencyMs: Math.max(0, Math.round(end - start)),
+					message: error instanceof Error ? error.message : String(error)
+				});
+			}
+		}
+	}
+
+	private async prefetchNextTrack(trigger: string) {
+		if (this.useMock) {
+			return;
+		}
+		if (!this.shouldPrefetch()) {
+			return;
+		}
+		const nextIndex = this.getNextIndexForPrefetch();
+		if (nextIndex === null) {
+			return;
+		}
+		const next = this.state.queue[nextIndex];
+		if (!next) {
+			return;
+		}
+		if (isSonglinkTrack(next) && !next.tidalId) {
+			return;
+		}
+		const trackId = isSonglinkTrack(next) ? next.tidalId : next.id;
+		if (typeof trackId !== 'number') {
+			return;
+		}
+		if (this.lastPrefetchTrackId === trackId && Date.now() - this.lastPrefetchAt < PREFETCH_GUARD_MS) {
+			return;
+		}
+		if (this.prefetchAbort) {
+			this.prefetchAbort.abort();
+		}
+		this.prefetching = true;
+		this.lastPrefetchAt = Date.now();
+		this.lastPrefetchTrackId = trackId;
+		const controller = new AbortController();
+		this.prefetchAbort = controller;
+		try {
+			let resolvedTrack: Track | null = null;
+			if (isSonglinkTrack(next)) {
+				if (this.state.qualitySource === 'auto') {
+					resolvedTrack = await this.resolveSonglinkTrack(next);
+					this.replaceResolvedTrack(next.id, resolvedTrack);
+				}
+			} else {
+				resolvedTrack = next as Track;
+			}
+			const preferred =
+				resolvedTrack && this.state.qualitySource === 'auto'
+					? deriveTrackQuality(resolvedTrack) ?? 'LOSSLESS'
+					: this.state.quality;
+			const effectiveQuality = resolvedTrack
+				? this.normalizeQuality(resolvedTrack, preferred)
+				: preferred;
+			const data = await losslessAPI.getStreamData(trackId, effectiveQuality);
+			audioTelemetry.recordPrefetch();
+			if (audioTelemetry.enabled) {
+				audioTelemetry.logEvent('prefetch-resolve', createSnapshot(this.state, this.audio), {
+					trackId,
+					quality: effectiveQuality,
+					trigger
+				});
+			}
+			if (controller.signal.aborted) {
+				return;
+			}
+			await this.warmStreamUrl(getProxiedUrl(data.url), controller.signal, trackId, effectiveQuality);
+		} catch (error) {
+			if (audioTelemetry.enabled) {
+				audioTelemetry.logEvent('prefetch-failure', createSnapshot(this.state, this.audio), {
+					trackId,
+					trigger,
+					message: error instanceof Error ? error.message : String(error)
+				});
+			}
+		} finally {
+			this.prefetching = false;
+			if (this.prefetchAbort === controller) {
+				this.prefetchAbort = null;
+			}
+		}
+	}
+
 	private async retryCurrentTrack() {
 		const track = this.state.currentTrack;
 		if (!track || isSonglinkTrack(track)) {
 			return;
+		}
+		const now = Date.now();
+		const shouldReset = now - this.lastRetryAt > 15000;
+		const retryIndex = shouldReset ? 0 : this.retryCount;
+		this.retryCount = retryIndex + 1;
+		this.lastRetryAt = now;
+		const delayMs = RETRY_BACKOFF_MS[Math.min(retryIndex, RETRY_BACKOFF_MS.length - 1)] ?? 0;
+		if (delayMs > 0) {
+			await new Promise((resolve) => setTimeout(resolve, delayMs));
 		}
 		const token = ++this.loadToken;
 		this.dispatch({ type: 'BUMP_GENERATION' });
@@ -944,9 +1650,6 @@ export class AudioController {
 		if (!this.activeSrc) {
 			return;
 		}
-		if (this.audio.readyState < 2) {
-			return;
-		}
 		void this.attemptPlay(reason);
 	}
 
@@ -954,6 +1657,10 @@ export class AudioController {
 		if (!this.state.currentTrack) {
 			return;
 		}
+		if (this.playInFlight) {
+			return;
+		}
+		this.playInFlight = true;
 		this.endedToken = -1;
 		this.pendingPlay = true;
 		this.logCommand('play', { reason });
@@ -962,19 +1669,31 @@ export class AudioController {
 			this.unlocked = true;
 			this.pendingPlay = false;
 			this.dispatch({ type: 'SET_NEEDS_GESTURE', needsGesture: false });
+			this.resolveLoadOutcomeIfPending('playing', { event: 'play-resolved' });
 		} catch (error) {
 			const name = error instanceof DOMException ? error.name : 'Error';
 			this.pendingPlay = false;
 			if (name === 'NotAllowedError') {
 				this.dispatch({ type: 'SET_NEEDS_GESTURE', needsGesture: true });
 				this.setStatus('blocked', 'gesture');
+				this.resolveLoadOutcomeIfPending('blocked', { event: 'play-rejected', name });
 			} else {
 				this.dispatch({
 					type: 'SET_ERROR',
 					error: error instanceof Error ? error.message : 'Play failed'
 				});
 				this.setStatus('error', 'play-failed');
+				audioTelemetry.recordPlaybackFailure();
+				this.resolveLoadOutcomeIfPending('error', { event: 'play-rejected', name });
 			}
+			if (audioTelemetry.enabled) {
+				audioTelemetry.logEvent('play-reject', createSnapshot(this.state, this.audio), {
+					name,
+					message: error instanceof Error ? error.message : String(error)
+				});
+			}
+		} finally {
+			this.playInFlight = false;
 		}
 	}
 
@@ -1127,7 +1846,7 @@ export class AudioController {
 			void this.unlockAudioFromGesture();
 			this.pendingPlay = true;
 			this.logCommand('playRequest', { reason });
-			if (this.audio.readyState >= 2 && this.activeSrc) {
+			if (this.activeSrc) {
 				void this.attemptPlay(reason);
 				return;
 			}
@@ -1141,6 +1860,8 @@ export class AudioController {
 			this.logCommand('pause', { reason });
 			this.audio.pause();
 			this.setStatus('paused', 'pause-request');
+			this.loadExpectPlay = false;
+			this.resolveLoadOutcomeIfPending('ready', { event: 'pause-request' });
 		});
 	}
 
@@ -1459,6 +2180,12 @@ export class AudioController {
 
 	destroy() {
 		this.destroyed = true;
+		this.cancelLoadOutcome('destroy');
+		this.clearLoadTimers();
+		if (this.prefetchAbort) {
+			this.prefetchAbort.abort();
+			this.prefetchAbort = null;
+		}
 		this.detachListeners();
 		this.mediaSession.destroy();
 		this.destroyShakaPlayer().catch(() => {});

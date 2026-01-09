@@ -526,7 +526,7 @@ class LosslessAPI {
 			payload &&
 			typeof payload === 'object' &&
 			'version' in (payload as Record<string, unknown>) &&
-			(payload as { version?: unknown }).version === '2.0'
+			String((payload as { version?: unknown }).version).startsWith('2.')
 		);
 	}
 
@@ -2646,3 +2646,4 @@ class LosslessAPI {
 }
 
 export const losslessAPI = new LosslessAPI();
+

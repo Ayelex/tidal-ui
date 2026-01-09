@@ -4,6 +4,7 @@
 	import { playerStore } from '$lib/stores/player';
 
 	const logs = audioTelemetry.logs;
+	const metrics = audioTelemetry.metrics;
 
 	const formatTime = (ts: number) => {
 		const date = new Date(ts);
@@ -31,6 +32,11 @@
 		</section>
 
 		<section class="debug-section">
+			<h2>Metrics</h2>
+			<pre>{JSON.stringify($metrics, null, 2)}</pre>
+		</section>
+
+		<section class="debug-section">
 			<h2>Event Timeline</h2>
 			<div class="log-table">
 				<div class="log-row log-row--header">
@@ -41,6 +47,7 @@
 					<div>Time</div>
 					<div>Duration</div>
 					<div>State</div>
+					<div>Detail</div>
 				</div>
 				{#each $logs as entry (entry.ts)}
 					<div class="log-row">
@@ -51,6 +58,9 @@
 						<div>{entry.currentTime.toFixed(2)}</div>
 						<div>{entry.duration.toFixed(2)}</div>
 						<div>{entry.paused ? 'paused' : 'playing'}</div>
+						<div class="log-detail" title={entry.detail ? JSON.stringify(entry.detail) : '-'}>
+							{entry.detail ? JSON.stringify(entry.detail) : '-'}
+						</div>
 					</div>
 				{/each}
 				{#if $logs.length === 0}
@@ -108,11 +118,17 @@
 
 	.log-row {
 		display: grid;
-		grid-template-columns: 120px 80px 140px 120px 80px 80px 80px;
+		grid-template-columns: 120px 80px 140px 120px 80px 80px 80px 1fr;
 		gap: 0.4rem;
 		font-size: 0.75rem;
 		padding: 0.2rem 0.4rem;
 		border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+	}
+
+	.log-detail {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 	}
 
 	.log-row--header {

@@ -8,6 +8,7 @@ export interface AudioElementLike {
 	ended?: boolean;
 	readyState: number;
 	networkState: number;
+	error?: MediaError | null;
 	preload: string;
 	autoplay: boolean;
 	loop: boolean;
@@ -23,6 +24,21 @@ export interface AudioElementLike {
 	addEventListener: (type: string, handler: EventHandler) => void;
 	removeEventListener: (type: string, handler: EventHandler) => void;
 	fastSeek?: (time: number) => void;
+}
+
+function resolveCrossOrigin(): string | null {
+	if (typeof window === 'undefined') {
+		return null;
+	}
+	const params = new URLSearchParams(window.location.search);
+	if (params.get('audioCors') === '1') {
+		return 'anonymous';
+	}
+	try {
+		return window.localStorage.getItem('tidal-audio-cors') === '1' ? 'anonymous' : null;
+	} catch {
+		return null;
+	}
 }
 
 class MockTimeRanges implements TimeRanges {
@@ -56,6 +72,7 @@ export class MockAudioElement implements AudioElementLike {
 	ended = false;
 	readyState = 0;
 	networkState = 0;
+	error: MediaError | null = null;
 	preload = 'auto';
 	autoplay = false;
 	loop = false;
@@ -102,6 +119,7 @@ export class MockAudioElement implements AudioElementLike {
 	}
 
 	load() {
+		this.emit('loadstart');
 		this.readyState = 2;
 		this.duration = this.duration > 0 ? this.duration : this.mockDuration;
 		this.buffered.setEnd(Math.min(this.duration, this.currentTime + 8));
@@ -110,6 +128,7 @@ export class MockAudioElement implements AudioElementLike {
 			this.emit('loadedmetadata');
 			this.emit('loadeddata');
 			this.emit('canplay');
+			this.emit('canplaythrough');
 		});
 	}
 
@@ -180,6 +199,7 @@ export function createAudioElement(options?: { mock?: boolean }) {
 	element.preload = 'auto';
 	element.autoplay = false;
 	element.loop = false;
-	element.crossOrigin = 'anonymous';
+	const crossOrigin = resolveCrossOrigin();
+	element.crossOrigin = crossOrigin;
 	return { element: element as AudioElementLike, realElement: element };
 }

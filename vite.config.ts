@@ -16,7 +16,7 @@ export default defineConfig(({ mode }) => {
 		: [];
 
 	return {
-		plugins: [sveltekit(), tailwindcss(), devtoolsJson()],
+		plugins: [tailwindcss(), sveltekit(), devtoolsJson()],
 		resolve: {
 			alias
 		},
@@ -37,3 +37,4 @@ export default defineConfig(({ mode }) => {
 		}
 	};
 });
+

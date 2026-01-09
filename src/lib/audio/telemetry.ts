@@ -19,6 +19,21 @@ export interface AudioLogEntry {
 	detail?: Record<string, unknown>;
 }
 
+export interface AudioMetrics {
+	resolveAttempts: number;
+	resolveSuccesses: number;
+	resolveFailures: number;
+	streamCacheHits: number;
+	streamCacheMisses: number;
+	playbackStarts: number;
+	playbackFailures: number;
+	startupLatencyMsAvg: number;
+	startupLatencySamples: number;
+	lastStartupLatencyMs?: number;
+	lastResolveLatencyMs?: number;
+	prefetchCount: number;
+}
+
 const LOG_LIMIT = 600;
 
 function resolveEnabled() {
@@ -35,6 +50,42 @@ function resolveEnabled() {
 export function createAudioTelemetry() {
 	const enabled = resolveEnabled();
 	const logs = writable<AudioLogEntry[]>([]);
+	const metrics = writable<AudioMetrics>({
+		resolveAttempts: 0,
+		resolveSuccesses: 0,
+		resolveFailures: 0,
+		streamCacheHits: 0,
+		streamCacheMisses: 0,
+		playbackStarts: 0,
+		playbackFailures: 0,
+		startupLatencyMsAvg: 0,
+		startupLatencySamples: 0,
+		lastStartupLatencyMs: undefined,
+		lastResolveLatencyMs: undefined,
+		prefetchCount: 0
+	});
+
+	const logToConsole = (entry: AudioLogEntry) => {
+		if (!enabled) {
+			return;
+		}
+		if (entry.kind === 'state') {
+			return;
+		}
+		const label = `[audio] ${entry.kind}:${entry.name}`;
+		const base = {
+			trackId: entry.trackId,
+			src: entry.src,
+			currentTime: entry.currentTime,
+			duration: entry.duration,
+			readyState: entry.readyState,
+			networkState: entry.networkState,
+			paused: entry.paused,
+			ended: entry.ended
+		};
+		const payload = entry.detail ? { ...base, ...entry.detail } : base;
+		console.debug(label, payload);
+	};
 
 	const push = (entry: AudioLogEntry) => {
 		if (!enabled) {
@@ -45,11 +96,13 @@ export function createAudioTelemetry() {
 			next.push(entry);
 			return next;
 		});
+		logToConsole(entry);
 	};
 
 	return {
 		enabled,
 		logs,
+		metrics,
 		clear: () => logs.set([]),
 		logEntry: (entry: Omit<AudioLogEntry, 'ts'>) => push({ ts: Date.now(), ...entry }),
 		logEvent: (name: string, snapshot: Omit<AudioLogEntry, 'ts' | 'kind' | 'name'>, detail?: Record<string, unknown>) =>
@@ -73,7 +126,60 @@ export function createAudioTelemetry() {
 				paused: !state.isPlaying,
 				ended: false,
 				detail
-			})
+			}),
+		recordResolveAttempt: () =>
+			metrics.update((current) => ({
+				...current,
+				resolveAttempts: current.resolveAttempts + 1
+			})),
+		recordResolveSuccess: (latencyMs?: number) =>
+			metrics.update((current) => ({
+				...current,
+				resolveSuccesses: current.resolveSuccesses + 1,
+				lastResolveLatencyMs: typeof latencyMs === 'number' ? latencyMs : current.lastResolveLatencyMs
+			})),
+		recordResolveFailure: () =>
+			metrics.update((current) => ({
+				...current,
+				resolveFailures: current.resolveFailures + 1
+			})),
+		recordCacheHit: () =>
+			metrics.update((current) => ({
+				...current,
+				streamCacheHits: current.streamCacheHits + 1
+			})),
+		recordCacheMiss: () =>
+			metrics.update((current) => ({
+				...current,
+				streamCacheMisses: current.streamCacheMisses + 1
+			})),
+		recordPlaybackStart: (latencyMs?: number) =>
+			metrics.update((current) => {
+				const samples = current.startupLatencySamples + (typeof latencyMs === 'number' ? 1 : 0);
+				const avg =
+					typeof latencyMs === 'number'
+						? (current.startupLatencyMsAvg * current.startupLatencySamples + latencyMs) /
+						  Math.max(1, samples)
+						: current.startupLatencyMsAvg;
+				return {
+					...current,
+					playbackStarts: current.playbackStarts + 1,
+					startupLatencySamples: samples,
+					startupLatencyMsAvg: avg,
+					lastStartupLatencyMs:
+						typeof latencyMs === 'number' ? latencyMs : current.lastStartupLatencyMs
+				};
+			}),
+		recordPlaybackFailure: () =>
+			metrics.update((current) => ({
+				...current,
+				playbackFailures: current.playbackFailures + 1
+			})),
+		recordPrefetch: () =>
+			metrics.update((current) => ({
+				...current,
+				prefetchCount: current.prefetchCount + 1
+			}))
 	};
 }
 
