@@ -56,6 +56,21 @@ type ActiveStreamMeta = StreamCandidate & {
 	trackId: number;
 };
 
+type CrossfadeState = {
+	active: boolean;
+	startTime: number;
+	durationSec: number;
+	progress: number;
+	nextIndex: number;
+	nextTrack: Track;
+	nextPreferredQuality: AudioQuality;
+	nextAudio: AudioElementLike;
+	nextRealAudio: HTMLAudioElement | null;
+	nextStreamMeta: ActiveStreamMeta;
+	nextReplayGain: number | null;
+	rafId: number | null;
+};
+
 const hiResQualities = new Set<AudioQuality>(['HI_RES_LOSSLESS']);
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
@@ -68,6 +83,13 @@ const RETRY_BACKOFF_MS = [0, 500, 1500];
 const PREFETCH_GUARD_MS = 15000;
 const PROBE_TIMEOUT_MS = 5000;
 const PREFETCH_RANGE_BYTES = 65535;
+const CROSSFADE_MAX_SECONDS = 12;
+const CROSSFADE_MIN_SECONDS = 0;
+const CROSSFADE_READY_TIMEOUT_MS = 4000;
+const PREFETCH_NEXT_COUNT = 15;
+const PREFETCH_HISTORY_COUNT = 10;
+const PREFETCH_RECENT_WARM_COUNT = 5;
+const PREFETCH_RESOLVE_ATTEMPTS = 3;
 
 const SILENT_AUDIO_DATA_URI =
 	'data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YSADAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==';
@@ -120,6 +142,10 @@ export interface AudioControllerOptions {
 export class AudioController {
 	private state: AudioState;
 	private setState: (state: AudioState) => void;
+	private audioPrimary: AudioElementLike;
+	private audioSecondary: AudioElementLike;
+	private realAudioPrimary: HTMLAudioElement | null;
+	private realAudioSecondary: HTMLAudioElement | null;
 	private audio: AudioElementLike;
 	private realAudio: HTMLAudioElement | null;
 	private shakaNamespace: ShakaNamespace | null = null;
@@ -157,8 +183,16 @@ export class AudioController {
 	private prefetchAbort: AbortController | null = null;
 	private prefetching = false;
 	private lastPrefetchAt = 0;
-	private lastPrefetchTrackId: number | null = null;
 	private activeProbeController: AbortController | null = null;
+	private crossfade: CrossfadeState | null = null;
+	private crossfadeToken = 0;
+	private crossfadePreparing = false;
+	private lastCrossfadeAttemptAt = 0;
+	private lastCrossfadeTrackId: number | null = null;
+	private recentTracks: Track[] = [];
+	private lastSeekRequest: { time: number; reason: string; at: number } | null = null;
+	private lastSeekPrefetchAt = 0;
+	private lastProgressPrefetchTrackId: number | null = null;
 	private mediaSession = createMediaSessionBridge({
 		onPlay: () => this.play('media-session'),
 		onPause: () => this.pause('media-session'),
@@ -177,19 +211,30 @@ export class AudioController {
 		this.setState = options.setState;
 
 		const useMock = resolveMockFlag();
-		const created = createAudioElement({ mock: useMock });
-		this.audio = created.element;
-		this.realAudio = created.realElement;
+		const primary = createAudioElement({ mock: useMock });
+		const secondary = createAudioElement({ mock: useMock });
+		this.audioPrimary = primary.element;
+		this.audioSecondary = secondary.element;
+		this.realAudioPrimary = primary.realElement;
+		this.realAudioSecondary = secondary.realElement;
+		this.audio = this.audioPrimary;
+		this.realAudio = this.realAudioPrimary;
 		this.useMock = this.audio instanceof MockAudioElement;
 
-		if (this.realAudio) {
-			this.realAudio.className = 'audio-engine';
-			this.realAudio.style.display = 'none';
-			this.realAudio.setAttribute('playsinline', 'true');
-			if (typeof document !== 'undefined') {
-				document.body.appendChild(this.realAudio);
+		const attachRealAudio = (element: HTMLAudioElement | null, label: string) => {
+			if (!element) {
+				return;
 			}
-		}
+			element.className = `audio-engine audio-engine--${label}`;
+			element.style.display = 'none';
+			element.setAttribute('playsinline', 'true');
+			if (typeof document !== 'undefined') {
+				document.body.appendChild(element);
+			}
+		};
+
+		attachRealAudio(this.realAudioPrimary, 'primary');
+		attachRealAudio(this.realAudioSecondary, 'secondary');
 
 		this.attachListeners();
 		this.applyVolume();
@@ -460,46 +505,46 @@ export class AudioController {
 		return this.state;
 	}
 
-	private attachListeners() {
-		this.audio.addEventListener('loadstart', this.handleLoadStart);
-		this.audio.addEventListener('timeupdate', this.handleTimeUpdate);
-		this.audio.addEventListener('loadedmetadata', this.handleLoadedMetadata);
-		this.audio.addEventListener('loadeddata', this.handleLoadedData);
-		this.audio.addEventListener('durationchange', this.handleDurationChange);
-		this.audio.addEventListener('progress', this.handleProgress);
-		this.audio.addEventListener('canplay', this.handleCanPlay);
-		this.audio.addEventListener('canplaythrough', this.handleCanPlayThrough);
-		this.audio.addEventListener('playing', this.handlePlaying);
-		this.audio.addEventListener('play', this.handlePlay);
-		this.audio.addEventListener('pause', this.handlePause);
-		this.audio.addEventListener('abort', this.handleAbort);
-		this.audio.addEventListener('waiting', this.handleWaiting);
-		this.audio.addEventListener('stalled', this.handleStalled);
-		this.audio.addEventListener('ended', this.handleEnded);
-		this.audio.addEventListener('error', this.handleError);
-		this.audio.addEventListener('seeking', this.handleSeeking);
-		this.audio.addEventListener('seeked', this.handleSeeked);
+	private attachListeners(target: AudioElementLike = this.audio) {
+		target.addEventListener('loadstart', this.handleLoadStart);
+		target.addEventListener('timeupdate', this.handleTimeUpdate);
+		target.addEventListener('loadedmetadata', this.handleLoadedMetadata);
+		target.addEventListener('loadeddata', this.handleLoadedData);
+		target.addEventListener('durationchange', this.handleDurationChange);
+		target.addEventListener('progress', this.handleProgress);
+		target.addEventListener('canplay', this.handleCanPlay);
+		target.addEventListener('canplaythrough', this.handleCanPlayThrough);
+		target.addEventListener('playing', this.handlePlaying);
+		target.addEventListener('play', this.handlePlay);
+		target.addEventListener('pause', this.handlePause);
+		target.addEventListener('abort', this.handleAbort);
+		target.addEventListener('waiting', this.handleWaiting);
+		target.addEventListener('stalled', this.handleStalled);
+		target.addEventListener('ended', this.handleEnded);
+		target.addEventListener('error', this.handleError);
+		target.addEventListener('seeking', this.handleSeeking);
+		target.addEventListener('seeked', this.handleSeeked);
 	}
 
-	private detachListeners() {
-		this.audio.removeEventListener('loadstart', this.handleLoadStart);
-		this.audio.removeEventListener('timeupdate', this.handleTimeUpdate);
-		this.audio.removeEventListener('loadedmetadata', this.handleLoadedMetadata);
-		this.audio.removeEventListener('loadeddata', this.handleLoadedData);
-		this.audio.removeEventListener('durationchange', this.handleDurationChange);
-		this.audio.removeEventListener('progress', this.handleProgress);
-		this.audio.removeEventListener('canplay', this.handleCanPlay);
-		this.audio.removeEventListener('canplaythrough', this.handleCanPlayThrough);
-		this.audio.removeEventListener('playing', this.handlePlaying);
-		this.audio.removeEventListener('play', this.handlePlay);
-		this.audio.removeEventListener('pause', this.handlePause);
-		this.audio.removeEventListener('abort', this.handleAbort);
-		this.audio.removeEventListener('waiting', this.handleWaiting);
-		this.audio.removeEventListener('stalled', this.handleStalled);
-		this.audio.removeEventListener('ended', this.handleEnded);
-		this.audio.removeEventListener('error', this.handleError);
-		this.audio.removeEventListener('seeking', this.handleSeeking);
-		this.audio.removeEventListener('seeked', this.handleSeeked);
+	private detachListeners(target: AudioElementLike = this.audio) {
+		target.removeEventListener('loadstart', this.handleLoadStart);
+		target.removeEventListener('timeupdate', this.handleTimeUpdate);
+		target.removeEventListener('loadedmetadata', this.handleLoadedMetadata);
+		target.removeEventListener('loadeddata', this.handleLoadedData);
+		target.removeEventListener('durationchange', this.handleDurationChange);
+		target.removeEventListener('progress', this.handleProgress);
+		target.removeEventListener('canplay', this.handleCanPlay);
+		target.removeEventListener('canplaythrough', this.handleCanPlayThrough);
+		target.removeEventListener('playing', this.handlePlaying);
+		target.removeEventListener('play', this.handlePlay);
+		target.removeEventListener('pause', this.handlePause);
+		target.removeEventListener('abort', this.handleAbort);
+		target.removeEventListener('waiting', this.handleWaiting);
+		target.removeEventListener('stalled', this.handleStalled);
+		target.removeEventListener('ended', this.handleEnded);
+		target.removeEventListener('error', this.handleError);
+		target.removeEventListener('seeking', this.handleSeeking);
+		target.removeEventListener('seeked', this.handleSeeked);
 	}
 
 	private shouldIgnoreEvent(): boolean {
@@ -551,6 +596,8 @@ export class AudioController {
 		}
 		this.updateBufferedPercent();
 		this.updateMediaSessionPositionState(now);
+		this.maybeStartCrossfade(currentTime);
+		this.maybeTriggerProgressPrefetch(currentTime);
 		if (audioTelemetry.enabled) {
 			audioTelemetry.logEvent('timeupdate', createSnapshot(this.state, this.audio));
 		}
@@ -680,7 +727,16 @@ export class AudioController {
 				});
 			}
 		}
-		void this.prefetchNextTrack('playing');
+		if (currentTrack && !isSonglinkTrack(currentTrack)) {
+			this.recordRecentlyPlayed(currentTrack as Track);
+		}
+		void this.prefetchQueueWindow('playing', {
+			count: PREFETCH_NEXT_COUNT,
+			warmAll: true,
+			warmRecent: true,
+			allowRetry: true,
+			allowSlow: true
+		});
 		this.updateMediaSessionPlaybackState();
 	};
 
@@ -750,6 +806,12 @@ export class AudioController {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
+		if (this.crossfade?.active) {
+			return;
+		}
+		if (this.crossfadePreparing) {
+			this.cancelCrossfade('ended');
+		}
 		if (this.endedToken === this.loadToken) {
 			return;
 		}
@@ -782,12 +844,45 @@ export class AudioController {
 			audioTelemetry.logEvent('seeked', createSnapshot(this.state, this.audio));
 		}
 		this.updateMediaSessionPositionState(Date.now());
+		// Allow crossfade to retry immediately after a user seek near the end.
+		this.lastCrossfadeAttemptAt = 0;
+		this.lastCrossfadeTrackId = null;
+		if (Number.isFinite(currentTime)) {
+			this.maybeStartCrossfade(currentTime);
+		}
+		const seek = this.lastSeekRequest;
+		this.lastSeekRequest = null;
+		if (seek && this.isManualSeekReason(seek.reason)) {
+			const duration = this.audio.duration;
+			if (Number.isFinite(duration) && duration > 0 && Number.isFinite(currentTime)) {
+				const progress = currentTime / duration;
+				const count = this.resolveSeekPrefetchCount(progress);
+				this.lastSeekPrefetchAt = Date.now();
+				const currentId = this.state.currentTrack
+					? isSonglinkTrack(this.state.currentTrack)
+						? this.state.currentTrack.tidalId ?? null
+						: this.state.currentTrack.id
+					: null;
+				if (currentId) {
+					this.lastProgressPrefetchTrackId = currentId;
+				}
+				void this.prefetchQueueWindow(`seek-${Math.round(progress * 100)}`, {
+					count,
+					warmAll: true,
+					warmRecent: true,
+					force: true,
+					allowRetry: true,
+					allowSlow: true
+				});
+			}
+		}
 	};
 
 	private handleError = () => {
 		if (this.shouldIgnoreEvent()) {
 			return;
 		}
+		this.cancelCrossfade('error');
 		const errorCode = this.audio.error?.code;
 		if (audioTelemetry.enabled) {
 			audioTelemetry.logEvent('error', createSnapshot(this.state, this.audio), {
@@ -885,8 +980,142 @@ export class AudioController {
 		const base = clamp(this.state.volume, 0, 1);
 		const gain = this.state.replayGain ? Math.pow(10, this.state.replayGain / 20) : 1;
 		const volume = clamp(base * gain, 0, 1);
+		const muted = this.state.muted;
+		if (this.crossfade?.active) {
+			const nextGain = this.crossfade.nextReplayGain
+				? Math.pow(10, this.crossfade.nextReplayGain / 20)
+				: 1;
+			const nextVolume = clamp(base * nextGain, 0, 1);
+			const currentFade = clamp(1 - this.crossfade.progress, 0, 1);
+			const nextFade = clamp(this.crossfade.progress, 0, 1);
+			this.audio.volume = volume * currentFade;
+			this.audio.muted = muted;
+			this.crossfade.nextAudio.volume = nextVolume * nextFade;
+			this.crossfade.nextAudio.muted = muted;
+			return;
+		}
 		this.audio.volume = volume;
-		this.audio.muted = this.state.muted;
+		this.audio.muted = muted;
+	}
+
+	private normalizeCrossfadeSeconds(value: number): number {
+		if (!Number.isFinite(value)) {
+			return 0;
+		}
+		return clamp(Math.round(value), CROSSFADE_MIN_SECONDS, CROSSFADE_MAX_SECONDS);
+	}
+
+	private isManualSeekReason(reason: string) {
+		return ['ui', 'external', 'media-session', 'user', 'debug'].includes(reason);
+	}
+
+	private resolveSeekPrefetchCount(progress: number) {
+		if (!Number.isFinite(progress)) {
+			return PREFETCH_NEXT_COUNT;
+		}
+		if (progress < 0.25) {
+			return 7;
+		}
+		if (progress < 0.5) {
+			return 4;
+		}
+		if (progress < 0.75) {
+			return 4;
+		}
+		if (progress < 0.85) {
+			return 2;
+		}
+		return 1;
+	}
+
+	private resolveQualityForPrefetch(track: Track): AudioQuality {
+		if (this.state.qualitySource === 'auto') {
+			return deriveTrackQuality(track) ?? 'LOSSLESS';
+		}
+		return this.state.quality;
+	}
+
+	private getUpcomingIndices(limit: number): number[] {
+		const { queue, queueIndex, repeatMode, shuffleEnabled } = this.state;
+		if (!Number.isFinite(limit) || limit <= 0) {
+			return [];
+		}
+		if (queue.length <= 1) {
+			return [];
+		}
+		const allowWrap = repeatMode === 'all';
+		const indices: number[] = [];
+		const seen = new Set<number>();
+		if (!shuffleEnabled) {
+			let idx = queueIndex + 1;
+			while (indices.length < limit) {
+				if (idx >= queue.length) {
+					if (!allowWrap) {
+						break;
+					}
+					idx = 0;
+				}
+				if (idx === queueIndex || seen.has(idx)) {
+					idx += 1;
+					continue;
+				}
+				indices.push(idx);
+				seen.add(idx);
+				idx += 1;
+			}
+			return indices;
+		}
+		if (this.shuffleBag.length > 0) {
+			for (const next of this.shuffleBag) {
+				if (indices.length >= limit) {
+					break;
+				}
+				if (next === queueIndex || seen.has(next)) {
+					continue;
+				}
+				indices.push(next);
+				seen.add(next);
+			}
+		}
+		if (indices.length < limit && allowWrap) {
+			const bag = this.buildShuffleBag(queue, queueIndex);
+			for (const next of bag) {
+				if (indices.length >= limit) {
+					break;
+				}
+				if (next === queueIndex || seen.has(next)) {
+					continue;
+				}
+				indices.push(next);
+				seen.add(next);
+			}
+		}
+		return indices;
+	}
+
+	private recordRecentlyPlayed(track: Track) {
+		if (!track || !Number.isFinite(track.id)) {
+			return;
+		}
+		const next = [track, ...this.recentTracks.filter((entry) => entry.id !== track.id)];
+		this.recentTracks = next.slice(0, PREFETCH_HISTORY_COUNT);
+	}
+
+	private swapActiveAudio(nextAudio: AudioElementLike, nextRealAudio: HTMLAudioElement | null) {
+		if (this.audio === nextAudio) {
+			return;
+		}
+		this.detachListeners(this.audio);
+		this.audio = nextAudio;
+		this.realAudio = nextRealAudio;
+		this.attachListeners(this.audio);
+	}
+
+	private getInactiveAudio(): { audio: AudioElementLike; realAudio: HTMLAudioElement | null } {
+		if (this.audio === this.audioPrimary) {
+			return { audio: this.audioSecondary, realAudio: this.realAudioSecondary };
+		}
+		return { audio: this.audioPrimary, realAudio: this.realAudioPrimary };
 	}
 
 	private async ensureShakaPlayer() {
@@ -1233,6 +1462,7 @@ export class AudioController {
 		if (this.destroyed) {
 			return;
 		}
+		this.cancelCrossfade('load-track');
 		const token = ++this.loadToken;
 		this.endedToken = -1;
 		this.activeSrc = null;
@@ -1459,12 +1689,12 @@ export class AudioController {
 		}
 	}
 
-	private shouldPrefetch(): boolean {
+	private shouldPrefetch(options?: { allowSlow?: boolean; ignoreGuard?: boolean }): boolean {
 		if (this.prefetching) {
 			return false;
 		}
 		const now = Date.now();
-		if (now - this.lastPrefetchAt < PREFETCH_GUARD_MS) {
+		if (!options?.ignoreGuard && now - this.lastPrefetchAt < PREFETCH_GUARD_MS) {
 			return false;
 		}
 		if (typeof navigator === 'undefined') {
@@ -1476,28 +1706,14 @@ export class AudioController {
 		if (connection?.saveData) {
 			return false;
 		}
-		if (connection?.effectiveType && ['slow-2g', '2g'].includes(connection.effectiveType)) {
+		if (
+			!options?.allowSlow &&
+			connection?.effectiveType &&
+			['slow-2g', '2g'].includes(connection.effectiveType)
+		) {
 			return false;
 		}
 		return true;
-	}
-
-	private getNextIndexForPrefetch(): number | null {
-		const { queue, queueIndex, repeatMode, shuffleEnabled } = this.state;
-		if (queue.length <= 1) {
-			return null;
-		}
-		const allowWrap = repeatMode === 'all';
-		if (!shuffleEnabled) {
-			if (queueIndex < queue.length - 1) {
-				return queueIndex + 1;
-			}
-			return allowWrap ? 0 : null;
-		}
-		if (this.shuffleBag.length > 0) {
-			return this.shuffleBag[0] ?? null;
-		}
-		return null;
 	}
 
 	private async warmStreamUrl(
@@ -1540,82 +1756,586 @@ export class AudioController {
 		}
 	}
 
-	private async prefetchNextTrack(trigger: string) {
+	private async prefetchQueueWindow(
+		trigger: string,
+		options?: {
+			count?: number;
+			warmAll?: boolean;
+			warmRecent?: boolean;
+			force?: boolean;
+			allowSlow?: boolean;
+			allowRetry?: boolean;
+		}
+	): Promise<number> {
 		if (this.useMock) {
-			return;
+			return 0;
 		}
-		if (!this.shouldPrefetch()) {
-			return;
+		if (this.prefetching && options?.force && this.prefetchAbort) {
+			this.prefetchAbort.abort();
+			this.prefetchAbort = null;
+			this.prefetching = false;
 		}
-		const nextIndex = this.getNextIndexForPrefetch();
-		if (nextIndex === null) {
-			return;
+		if (this.prefetching && !options?.force) {
+			return 0;
 		}
-		const next = this.state.queue[nextIndex];
-		if (!next) {
-			return;
+		const allowSlow = options?.allowSlow ?? true;
+		const ignoreGuard = Boolean(options?.force);
+		if (!this.shouldPrefetch({ allowSlow, ignoreGuard })) {
+			return 0;
 		}
-		if (isSonglinkTrack(next) && !next.tidalId) {
-			return;
+		const upcomingCount = options?.count ?? PREFETCH_NEXT_COUNT;
+		const upcomingIndices = this.getUpcomingIndices(upcomingCount);
+		const upcoming = upcomingIndices
+			.map((index) => this.state.queue[index])
+			.filter((track): track is PlayableTrack => Boolean(track));
+		const current = this.state.currentTrack;
+		const recent = this.recentTracks.filter((track) => track.id !== current?.id);
+
+		const items: Array<{ trackId: number; quality: AudioQuality; warm: boolean }> = [];
+		const seen = new Set<string>();
+		const pushItem = (trackId: number, quality: AudioQuality, warm: boolean) => {
+			const key = `${trackId}:${quality}`;
+			if (seen.has(key)) {
+				return;
+			}
+			seen.add(key);
+			items.push({ trackId, quality, warm });
+		};
+
+		const warmAll = Boolean(options?.warmAll);
+		const warmRecent = Boolean(options?.warmRecent);
+		const resolveAttempts = options?.allowRetry ? PREFETCH_RESOLVE_ATTEMPTS : 1;
+		const delayForAttempt = async (attempt: number) => {
+			const delayMs = RETRY_BACKOFF_MS[Math.min(attempt - 1, RETRY_BACKOFF_MS.length - 1)] ?? 0;
+			if (delayMs > 0) {
+				await new Promise((resolve) => setTimeout(resolve, delayMs));
+			}
+		};
+
+		for (const track of upcoming) {
+			let resolvedTrack: Track | null = null;
+			let trackId: number | null = null;
+			for (let attempt = 1; attempt <= resolveAttempts; attempt += 1) {
+				if (isSonglinkTrack(track)) {
+					if (!track.tidalId || this.state.qualitySource === 'auto') {
+						try {
+							resolvedTrack = await this.resolveSonglinkTrack(track);
+							this.replaceResolvedTrack(track.id, resolvedTrack);
+						} catch {
+							resolvedTrack = null;
+						}
+					}
+					trackId = resolvedTrack?.id ?? track.tidalId ?? null;
+				} else {
+					resolvedTrack = track as Track;
+					trackId = resolvedTrack.id;
+				}
+				if (Number.isFinite(trackId)) {
+					break;
+				}
+				if (attempt < resolveAttempts) {
+					await delayForAttempt(attempt);
+				}
+			}
+			if (!Number.isFinite(trackId)) {
+				continue;
+			}
+			const preferred = resolvedTrack ? this.resolveQualityForPrefetch(resolvedTrack) : this.state.quality;
+			const effectiveQuality = resolvedTrack ? this.normalizeQuality(resolvedTrack, preferred) : preferred;
+			pushItem(trackId, effectiveQuality, warmAll || items.length === 0);
 		}
-		const trackId = isSonglinkTrack(next) ? next.tidalId : next.id;
-		if (typeof trackId !== 'number') {
-			return;
+
+		const warmRecentCount = warmRecent ? PREFETCH_RECENT_WARM_COUNT : 0;
+		for (const track of recent.slice(0, warmRecentCount || recent.length)) {
+			const preferred = this.resolveQualityForPrefetch(track);
+			const effectiveQuality = this.normalizeQuality(track, preferred);
+			pushItem(track.id, effectiveQuality, warmRecent);
 		}
-		if (this.lastPrefetchTrackId === trackId && Date.now() - this.lastPrefetchAt < PREFETCH_GUARD_MS) {
-			return;
+
+		if (items.length === 0) {
+			return 0;
 		}
+
 		if (this.prefetchAbort) {
 			this.prefetchAbort.abort();
 		}
 		this.prefetching = true;
 		this.lastPrefetchAt = Date.now();
-		this.lastPrefetchTrackId = trackId;
 		const controller = new AbortController();
 		this.prefetchAbort = controller;
+		let resolvedCount = 0;
 		try {
-			let resolvedTrack: Track | null = null;
-			if (isSonglinkTrack(next)) {
-				if (this.state.qualitySource === 'auto') {
-					resolvedTrack = await this.resolveSonglinkTrack(next);
-					this.replaceResolvedTrack(next.id, resolvedTrack);
+			for (const item of items) {
+				if (controller.signal.aborted) {
+					return resolvedCount;
 				}
-			} else {
-				resolvedTrack = next as Track;
-			}
-			const preferred =
-				resolvedTrack && this.state.qualitySource === 'auto'
-					? deriveTrackQuality(resolvedTrack) ?? 'LOSSLESS'
-					: this.state.quality;
-			const effectiveQuality = resolvedTrack
-				? this.normalizeQuality(resolvedTrack, preferred)
-				: preferred;
-			const data = await losslessAPI.getStreamData(trackId, effectiveQuality);
-			audioTelemetry.recordPrefetch();
-			if (audioTelemetry.enabled) {
-				audioTelemetry.logEvent('prefetch-resolve', createSnapshot(this.state, this.audio), {
-					trackId,
-					quality: effectiveQuality,
-					trigger
-				});
-			}
-			if (controller.signal.aborted) {
-				return;
-			}
-			await this.warmStreamUrl(getProxiedUrl(data.url), controller.signal, trackId, effectiveQuality);
-		} catch (error) {
-			if (audioTelemetry.enabled) {
-				audioTelemetry.logEvent('prefetch-failure', createSnapshot(this.state, this.audio), {
-					trackId,
-					trigger,
-					message: error instanceof Error ? error.message : String(error)
-				});
+				const cached = streamCache.get(item.trackId, item.quality);
+				if (cached) {
+					if (item.warm) {
+						await this.warmStreamUrl(
+							getProxiedUrl(cached.url),
+							controller.signal,
+							item.trackId,
+							item.quality
+						);
+					}
+					resolvedCount += 1;
+					continue;
+				}
+				let resolved = false;
+				for (let attempt = 1; attempt <= resolveAttempts; attempt += 1) {
+					if (controller.signal.aborted) {
+						return resolvedCount;
+					}
+					try {
+						const data = await losslessAPI.getStreamData(item.trackId, item.quality);
+						streamCache.setValidated({
+							trackId: item.trackId,
+							quality: item.quality,
+							url: data.url,
+							replayGain: data.replayGain ?? null,
+							sampleRate: data.sampleRate ?? null,
+							bitDepth: data.bitDepth ?? null,
+							fetchedAt: Date.now()
+						});
+						resolved = true;
+						resolvedCount += 1;
+						audioTelemetry.recordPrefetch();
+						if (audioTelemetry.enabled) {
+							audioTelemetry.logEvent('prefetch-resolve', createSnapshot(this.state, this.audio), {
+								trackId: item.trackId,
+								quality: item.quality,
+								trigger,
+								attempt
+							});
+						}
+						if (controller.signal.aborted) {
+							return;
+						}
+						if (item.warm) {
+							await this.warmStreamUrl(
+								getProxiedUrl(data.url),
+								controller.signal,
+								item.trackId,
+								item.quality
+							);
+						}
+						break;
+					} catch (error) {
+						if (audioTelemetry.enabled) {
+							audioTelemetry.logEvent('prefetch-failure', createSnapshot(this.state, this.audio), {
+								trackId: item.trackId,
+								trigger,
+								attempt,
+								message: error instanceof Error ? error.message : String(error)
+							});
+						}
+						if (attempt < resolveAttempts) {
+							await delayForAttempt(attempt);
+						}
+					}
+				}
+				if (!resolved && audioTelemetry.enabled) {
+					audioTelemetry.logEvent('prefetch-abort-item', createSnapshot(this.state, this.audio), {
+						trackId: item.trackId,
+						trigger
+					});
+				}
 			}
 		} finally {
 			this.prefetching = false;
 			if (this.prefetchAbort === controller) {
 				this.prefetchAbort = null;
 			}
+		}
+		return resolvedCount;
+	}
+
+	private maybeStartCrossfade(currentTime: number) {
+		if (this.crossfade || this.crossfadePreparing) {
+			return;
+		}
+		if (this.state.status !== 'playing') {
+			return;
+		}
+		if (this.state.repeatMode === 'one') {
+			return;
+		}
+		const seconds = this.normalizeCrossfadeSeconds(this.state.crossfadeSeconds);
+		if (seconds <= 0) {
+			return;
+		}
+		if (hiResQualities.has(this.state.activeQuality ?? 'LOSSLESS')) {
+			return;
+		}
+		const duration = this.audio.duration;
+		if (!Number.isFinite(duration) || duration <= 0) {
+			return;
+		}
+		const remaining = duration - currentTime;
+		if (!Number.isFinite(remaining) || remaining > seconds || remaining <= 0) {
+			return;
+		}
+		const nowMs = Date.now();
+		const currentId = this.state.currentTrack
+			? isSonglinkTrack(this.state.currentTrack)
+				? this.state.currentTrack.tidalId ?? null
+				: this.state.currentTrack.id
+			: null;
+		if (
+			currentId &&
+			this.lastCrossfadeTrackId === currentId &&
+			nowMs - this.lastCrossfadeAttemptAt < 2000
+		) {
+			return;
+		}
+		const nextIndex = this.getUpcomingIndices(1)[0];
+		if (!Number.isFinite(nextIndex)) {
+			return;
+		}
+		const nextTrack = this.state.queue[nextIndex];
+		if (!nextTrack) {
+			return;
+		}
+		if (currentId) {
+			this.lastCrossfadeAttemptAt = nowMs;
+			this.lastCrossfadeTrackId = currentId;
+		}
+		void this.startCrossfade(nextIndex, nextTrack, seconds);
+	}
+
+	private maybeTriggerProgressPrefetch(currentTime: number) {
+		if (this.state.status !== 'playing') {
+			return;
+		}
+		const duration = this.audio.duration;
+		if (!Number.isFinite(duration) || duration <= 0) {
+			return;
+		}
+		const progress = currentTime / duration;
+		if (!Number.isFinite(progress) || progress < 0.5) {
+			return;
+		}
+		const currentId = this.state.currentTrack
+			? isSonglinkTrack(this.state.currentTrack)
+				? this.state.currentTrack.tidalId ?? null
+				: this.state.currentTrack.id
+			: null;
+		if (!currentId || this.lastProgressPrefetchTrackId === currentId) {
+			return;
+		}
+		if (Date.now() - this.lastSeekPrefetchAt < 3000) {
+			return;
+		}
+		this.lastProgressPrefetchTrackId = currentId;
+		void this.prefetchQueueWindow('progress-50', {
+			count: 5,
+			warmAll: true,
+			warmRecent: true,
+			force: true,
+			allowRetry: true,
+			allowSlow: true
+		});
+	}
+
+	private async waitForCrossfadeReady(
+		audio: AudioElementLike,
+		token: number,
+		timeoutMs: number = CROSSFADE_READY_TIMEOUT_MS
+	): Promise<boolean> {
+		if (token !== this.crossfadeToken) {
+			return false;
+		}
+		if (audio.readyState >= 2) {
+			return true;
+		}
+		return new Promise((resolve) => {
+			let resolved = false;
+			const finish = (result: boolean) => {
+				if (resolved) {
+					return;
+				}
+				resolved = true;
+				audio.removeEventListener('canplay', handleReady);
+				audio.removeEventListener('loadedmetadata', handleReady);
+				audio.removeEventListener('error', handleError);
+				clearTimeout(timeoutId);
+				resolve(result && token === this.crossfadeToken);
+			};
+			const handleReady = () => finish(true);
+			const handleError = () => finish(false);
+			const timeoutId = setTimeout(() => finish(false), timeoutMs);
+			audio.addEventListener('canplay', handleReady);
+			audio.addEventListener('loadedmetadata', handleReady);
+			audio.addEventListener('error', handleError);
+		});
+	}
+
+	private async prepareCrossfadeTrack(
+		nextTrack: PlayableTrack,
+		token: number
+	): Promise<{
+		nextTrack: Track;
+		nextPreferredQuality: AudioQuality;
+		nextAudio: AudioElementLike;
+		nextRealAudio: HTMLAudioElement | null;
+		nextStreamMeta: ActiveStreamMeta;
+	} | null> {
+		let resolvedTrack: Track;
+		let wasSonglink = false;
+		let sourceId = nextTrack.id;
+		try {
+			const resolved = await this.resolvePlayableTrack(nextTrack);
+			resolvedTrack = resolved.track;
+			wasSonglink = resolved.wasSonglink;
+			sourceId = resolved.sourceId;
+		} catch {
+			return null;
+		}
+		if (token !== this.crossfadeToken) {
+			return null;
+		}
+		if (wasSonglink) {
+			this.replaceResolvedTrack(sourceId, resolvedTrack);
+		}
+		const preferred = this.resolveQualityForPrefetch(resolvedTrack);
+		const effectiveQuality = this.normalizeQuality(resolvedTrack, preferred);
+		if (hiResQualities.has(effectiveQuality)) {
+			return null;
+		}
+
+		let candidate: StreamCandidate | null = null;
+		if (this.useMock) {
+			candidate = {
+				url: `mock://track/${resolvedTrack.id}?q=${effectiveQuality}`,
+				quality: effectiveQuality,
+				source: 'api',
+				replayGain: null,
+				sampleRate: null,
+				bitDepth: null,
+				resolvedAt: Date.now()
+			};
+		} else {
+			candidate = await this.resolveStreamCandidate(resolvedTrack, effectiveQuality, {
+				allowCache: true,
+				attempt: 1
+			});
+		}
+		if (!candidate || token !== this.crossfadeToken) {
+			return null;
+		}
+
+		const { audio: nextAudio, realAudio: nextRealAudio } = this.getInactiveAudio();
+		const cleanup = () => {
+			nextAudio.pause();
+			nextAudio.currentTime = 0;
+			nextAudio.src = '';
+		};
+		nextAudio.pause();
+		nextAudio.currentTime = 0;
+		nextAudio.src = getProxiedUrl(candidate.url);
+		nextAudio.load();
+
+		const ready = await this.waitForCrossfadeReady(nextAudio, token);
+		if (!ready || token !== this.crossfadeToken) {
+			cleanup();
+			return null;
+		}
+
+		const nextStreamMeta: ActiveStreamMeta = {
+			...candidate,
+			trackId: resolvedTrack.id
+		};
+
+		return {
+			nextTrack: resolvedTrack,
+			nextPreferredQuality: preferred,
+			nextAudio,
+			nextRealAudio,
+			nextStreamMeta
+		};
+	}
+
+	private async startCrossfade(nextIndex: number, nextTrack: PlayableTrack, seconds: number) {
+		if (this.crossfade || this.crossfadePreparing) {
+			return;
+		}
+		if (this.destroyed) {
+			return;
+		}
+		this.crossfadePreparing = true;
+		const token = ++this.crossfadeToken;
+		try {
+			const prepared = await this.prepareCrossfadeTrack(nextTrack, token);
+			if (!prepared || token !== this.crossfadeToken) {
+				return;
+			}
+			const {
+				nextAudio,
+				nextRealAudio,
+				nextStreamMeta,
+				nextTrack: resolvedTrack,
+				nextPreferredQuality
+			} = prepared;
+			nextAudio.volume = 0;
+			nextAudio.muted = this.state.muted;
+			try {
+				await nextAudio.play();
+			} catch {
+				nextAudio.pause();
+				nextAudio.currentTime = 0;
+				nextAudio.src = '';
+				return;
+			}
+			if (token !== this.crossfadeToken) {
+				return;
+			}
+			const currentTime = Number.isFinite(this.audio.currentTime) ? this.audio.currentTime : 0;
+			const duration = this.audio.duration;
+			const remaining =
+				Number.isFinite(duration) && duration > 0 ? Math.max(0, duration - currentTime) : seconds;
+			const durationSec = Math.max(0.2, Math.min(seconds, remaining || seconds));
+			this.crossfade = {
+				active: true,
+				startTime: currentTime,
+				durationSec,
+				progress: 0,
+				nextIndex,
+				nextTrack: resolvedTrack,
+				nextPreferredQuality,
+				nextAudio,
+				nextRealAudio,
+				nextStreamMeta,
+				nextReplayGain: nextStreamMeta.replayGain ?? null,
+				rafId: null
+			};
+			this.applyVolume();
+			this.tickCrossfade(token);
+		} finally {
+			if (token === this.crossfadeToken) {
+				this.crossfadePreparing = false;
+			}
+		}
+	}
+
+	private tickCrossfade(token: number) {
+		const state = this.crossfade;
+		if (!state || token !== this.crossfadeToken) {
+			return;
+		}
+		const currentTime = Number.isFinite(this.audio.currentTime)
+			? this.audio.currentTime
+			: state.startTime;
+		const elapsed = Math.max(0, currentTime - state.startTime);
+		const progress = clamp(elapsed / state.durationSec, 0, 1);
+		state.progress = progress;
+		this.crossfade = state;
+		this.applyVolume();
+		if (progress >= 1) {
+			this.finishCrossfade(token);
+			return;
+		}
+		if (typeof requestAnimationFrame === 'function') {
+			state.rafId = requestAnimationFrame(() => this.tickCrossfade(token));
+		} else {
+			state.rafId = (setTimeout(() => this.tickCrossfade(token), 50) as unknown) as number;
+		}
+	}
+
+	private finishCrossfade(token: number) {
+		const state = this.crossfade;
+		if (!state || token !== this.crossfadeToken) {
+			return;
+		}
+		if (state.rafId) {
+			if (typeof cancelAnimationFrame === 'function') {
+				cancelAnimationFrame(state.rafId);
+			} else {
+				clearTimeout(state.rafId);
+			}
+		}
+		const oldAudio = this.audio;
+		this.activeSrc = null;
+		oldAudio.pause();
+		oldAudio.currentTime = 0;
+		oldAudio.src = '';
+
+		this.swapActiveAudio(state.nextAudio, state.nextRealAudio);
+		this.activeSrc = this.audio.src;
+		this.activeStreamMeta = state.nextStreamMeta;
+		this.commitShuffleAdvance(state.nextIndex);
+
+		this.dispatch({ type: 'SET_TRACK', track: state.nextTrack, queueIndex: state.nextIndex });
+		if (this.state.qualitySource === 'auto') {
+			this.dispatch({
+				type: 'SET_QUALITY',
+				quality: state.nextPreferredQuality,
+				source: 'auto'
+			});
+		}
+		this.syncDuration();
+		const currentTime = this.audio.currentTime ?? 0;
+		if (Number.isFinite(currentTime) && currentTime > 0) {
+			this.dispatch({ type: 'SET_TIME', currentTime });
+		}
+		this.dispatch({ type: 'SET_ACTIVE_QUALITY', activeQuality: state.nextStreamMeta.quality });
+		this.dispatch({
+			type: 'SET_METADATA',
+			sampleRate: state.nextStreamMeta.sampleRate ?? null,
+			bitDepth: state.nextStreamMeta.bitDepth ?? null,
+			replayGain: state.nextStreamMeta.replayGain ?? null
+		});
+		this.dispatch({ type: 'SET_ERROR', error: null });
+		this.setStatus('playing', 'crossfade');
+		this.pendingPlay = false;
+		this.updateMediaSessionMetadata();
+		this.updateMediaSessionPlaybackState();
+		this.updateMediaSessionPositionState(Date.now());
+		this.mediaSession.refreshHandlers();
+		this.recordRecentlyPlayed(state.nextTrack);
+		streamCache.setValidated({
+			trackId: state.nextTrack.id,
+			quality: state.nextStreamMeta.quality,
+			url: state.nextStreamMeta.url,
+			replayGain: state.nextStreamMeta.replayGain,
+			sampleRate: state.nextStreamMeta.sampleRate,
+			bitDepth: state.nextStreamMeta.bitDepth,
+			fetchedAt: state.nextStreamMeta.resolvedAt
+		});
+		void this.prefetchQueueWindow('crossfade', {
+			count: PREFETCH_NEXT_COUNT,
+			warmAll: true,
+			warmRecent: true,
+			allowRetry: true,
+			allowSlow: true
+		});
+		this.applyVolume();
+		this.crossfade = null;
+	}
+
+	private cancelCrossfade(reason: string) {
+		if (!this.crossfade && !this.crossfadePreparing) {
+			return;
+		}
+		this.crossfadeToken += 1;
+		this.crossfadePreparing = false;
+		const state = this.crossfade;
+		if (state?.rafId) {
+			if (typeof cancelAnimationFrame === 'function') {
+				cancelAnimationFrame(state.rafId);
+			} else {
+				clearTimeout(state.rafId);
+			}
+		}
+		if (state?.nextAudio) {
+			state.nextAudio.pause();
+			state.nextAudio.currentTime = 0;
+			state.nextAudio.src = '';
+		}
+		this.crossfade = null;
+		this.applyVolume();
+		if (audioTelemetry.enabled) {
+			audioTelemetry.logEvent('crossfade-cancel', createSnapshot(this.state, this.audio), { reason });
 		}
 	}
 
@@ -1742,6 +2462,31 @@ export class AudioController {
 		return nextIndex;
 	}
 
+	private commitShuffleAdvance(nextIndex: number) {
+		const { queue, queueIndex, repeatMode, shuffleEnabled } = this.state;
+		if (!shuffleEnabled || queue.length <= 1) {
+			return;
+		}
+		const allowWrap = repeatMode === 'all';
+		if (this.shuffleBag.length === 0) {
+			if (!allowWrap) {
+				return;
+			}
+			this.shuffleBag = this.buildShuffleBag(queue, queueIndex);
+		}
+		if (this.shuffleBag.length > 0) {
+			if (this.shuffleBag[0] === nextIndex) {
+				this.shuffleBag.shift();
+			} else {
+				const idx = this.shuffleBag.indexOf(nextIndex);
+				if (idx >= 0) {
+					this.shuffleBag.splice(idx, 1);
+				}
+			}
+		}
+		this.shuffleHistory.push(queueIndex);
+	}
+
 	private getPreviousIndex(): number | null {
 		const { queue, queueIndex, repeatMode, shuffleEnabled } = this.state;
 		if (queue.length === 0) {
@@ -1807,6 +2552,7 @@ export class AudioController {
 	}
 	setQueue(queue: PlayableTrack[], startIndex = 0) {
 		this.scheduleCommand('setQueue', () => {
+			this.cancelCrossfade('set-queue');
 			const hasTracks = queue.length > 0;
 			const clampedIndex = hasTracks
 				? Math.min(Math.max(startIndex, 0), queue.length - 1)
@@ -1856,6 +2602,7 @@ export class AudioController {
 
 	pause(reason = 'user') {
 		this.scheduleCommand('pause', () => {
+			this.cancelCrossfade('pause');
 			this.pendingPlay = false;
 			this.logCommand('pause', { reason });
 			this.audio.pause();
@@ -1875,6 +2622,7 @@ export class AudioController {
 
 	playQueue(queue: PlayableTrack[], startIndex = 0, reason = 'play-queue') {
 		this.scheduleCommand('playQueue', () => {
+			this.cancelCrossfade('play-queue');
 			const hasTracks = queue.length > 0;
 			const clampedIndex = hasTracks
 				? Math.min(Math.max(startIndex, 0), queue.length - 1)
@@ -1907,6 +2655,7 @@ export class AudioController {
 
 	playAtIndex(index: number, options?: { reason?: string; shouldPlay?: boolean }) {
 		this.scheduleCommand('playAtIndex', () => {
+			this.cancelCrossfade('play-at-index');
 			if (index < 0 || index >= this.state.queue.length) {
 				return;
 			}
@@ -1932,6 +2681,7 @@ export class AudioController {
 
 	next(reason = 'user') {
 		this.scheduleCommand('next', () => {
+			this.cancelCrossfade('next');
 			const wasPlaying = this.state.isPlaying;
 			const nextIndex = this.getNextIndex();
 			this.logCommand('next', { reason, nextIndex });
@@ -1945,6 +2695,7 @@ export class AudioController {
 
 	previous(reason = 'user') {
 		this.scheduleCommand('previous', () => {
+			this.cancelCrossfade('previous');
 			const wasPlaying = this.state.isPlaying;
 			const currentTime = this.audio.currentTime ?? 0;
 			this.logCommand('previous', { reason, currentTime });
@@ -1963,6 +2714,8 @@ export class AudioController {
 
 	seekTo(seconds: number, reason = 'user') {
 		this.scheduleCommand('seek', () => {
+			this.lastSeekRequest = { time: seconds, reason, at: Date.now() };
+			this.cancelCrossfade('seek');
 			this.performSeek(seconds, reason);
 		});
 	}
@@ -1980,8 +2733,20 @@ export class AudioController {
 		this.applyVolume();
 	}
 
+	setCrossfadeSeconds(seconds: number) {
+		this.scheduleCommand('setCrossfade', () => {
+			const normalized = this.normalizeCrossfadeSeconds(seconds);
+			this.logCommand('setCrossfade', { seconds: normalized });
+			this.dispatch({ type: 'SET_CROSSFADE', seconds: normalized });
+			if (normalized <= 0) {
+				this.cancelCrossfade('disabled');
+			}
+		});
+	}
+
 	setQuality(quality: AudioQuality, source: 'auto' | 'manual' = 'manual') {
 		this.scheduleCommand('setQuality', () => {
+			this.cancelCrossfade('quality-change');
 			this.logCommand('setQuality', { quality, source });
 			this.dispatch({ type: 'SET_QUALITY', quality, source });
 			if (source === 'manual') {
@@ -2001,6 +2766,7 @@ export class AudioController {
 	}
 
 	setRepeatMode(repeatMode: RepeatMode) {
+		this.cancelCrossfade('repeat-mode');
 		this.logCommand('setRepeatMode', { repeatMode });
 		this.dispatch({ type: 'SET_REPEAT', repeatMode });
 	}
@@ -2016,6 +2782,7 @@ export class AudioController {
 	}
 
 	toggleShuffle() {
+		this.cancelCrossfade('shuffle');
 		this.logCommand('toggleShuffle', { enabled: !this.state.shuffleEnabled });
 		this.dispatch({ type: 'SET_SHUFFLE', enabled: !this.state.shuffleEnabled });
 		this.resetShuffle();
@@ -2023,6 +2790,7 @@ export class AudioController {
 	}
 
 	setShuffleSeed(seed: number | null) {
+		this.cancelCrossfade('shuffle-seed');
 		this.random = seed === null ? Math.random : createSeededRng(seed);
 		this.logCommand('setShuffleSeed', { seed });
 		this.resetShuffle();
@@ -2030,6 +2798,7 @@ export class AudioController {
 
 	replaceQueueItem(index: number, track: PlayableTrack) {
 		this.scheduleCommand('replaceQueueItem', () => {
+			this.cancelCrossfade('replace-queue-item');
 			if (index < 0 || index >= this.state.queue.length) {
 				return;
 			}
@@ -2044,6 +2813,7 @@ export class AudioController {
 
 	enqueue(track: PlayableTrack) {
 		this.scheduleCommand('enqueue', () => {
+			this.cancelCrossfade('enqueue');
 			this.logCommand('enqueue', { trackId: track.id });
 			const queue = this.state.queue.slice();
 			queue.push(track);
@@ -2067,6 +2837,7 @@ export class AudioController {
 
 	enqueueNext(track: PlayableTrack) {
 		this.scheduleCommand('enqueueNext', () => {
+			this.cancelCrossfade('enqueue-next');
 			this.logCommand('enqueueNext', { trackId: track.id });
 			const queue = this.state.queue.slice();
 			this.mediaSession.refreshHandlers();
@@ -2091,6 +2862,7 @@ export class AudioController {
 
 	removeFromQueue(index: number) {
 		this.scheduleCommand('removeFromQueue', () => {
+			this.cancelCrossfade('remove-from-queue');
 			if (index < 0 || index >= this.state.queue.length) {
 				return;
 			}
@@ -2128,6 +2900,7 @@ export class AudioController {
 
 	clearQueue() {
 		this.scheduleCommand('clearQueue', () => {
+			this.cancelCrossfade('clear-queue');
 			this.logCommand('clearQueue');
 			this.dispatch({ type: 'SET_QUEUE', queue: [], queueIndex: -1, currentTrack: null });
 			this.mediaSession.refreshHandlers();
@@ -2144,6 +2917,7 @@ export class AudioController {
 
 	reset() {
 		this.scheduleCommand('reset', () => {
+			this.cancelCrossfade('reset');
 			this.logCommand('reset');
 			const prefs = get(userPreferencesStore);
 			const base = {
@@ -2174,23 +2948,31 @@ export class AudioController {
 			this.audio.currentTime = 0;
 			this.audio.src = '';
 			this.activeSrc = null;
+			this.recentTracks = [];
+			this.lastCrossfadeAttemptAt = 0;
+			this.lastCrossfadeTrackId = null;
 			this.setStatus('idle', 'reset');
 		});
 	}
 
 	destroy() {
 		this.destroyed = true;
+		this.cancelCrossfade('destroy');
 		this.cancelLoadOutcome('destroy');
 		this.clearLoadTimers();
 		if (this.prefetchAbort) {
 			this.prefetchAbort.abort();
 			this.prefetchAbort = null;
 		}
-		this.detachListeners();
+		this.detachListeners(this.audioPrimary);
+		this.detachListeners(this.audioSecondary);
 		this.mediaSession.destroy();
 		this.destroyShakaPlayer().catch(() => {});
-		if (this.realAudio && this.realAudio.parentElement) {
-			this.realAudio.parentElement.removeChild(this.realAudio);
+		if (this.realAudioPrimary && this.realAudioPrimary.parentElement) {
+			this.realAudioPrimary.parentElement.removeChild(this.realAudioPrimary);
+		}
+		if (this.realAudioSecondary && this.realAudioSecondary.parentElement) {
+			this.realAudioSecondary.parentElement.removeChild(this.realAudioSecondary);
 		}
 	}
 }

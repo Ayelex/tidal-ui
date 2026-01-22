@@ -135,6 +135,11 @@
 		return QUALITY_OPTIONS.find((option) => option.value === quality)?.label ?? 'Quality';
 	});
 
+	const crossfadeLabel = $derived(() => {
+		const value = $playerStore.crossfadeSeconds;
+		return value > 0 ? `${value}s` : 'Off';
+	});
+
 	const convertAacToMp3 = $derived($userPreferencesStore.convertAacToMp3);
 	const downloadCoversSeperately = $derived($userPreferencesStore.downloadCoversSeperately);
 
@@ -149,6 +154,18 @@
 
 	function toggleDownloadCoversSeperately(): void {
 		userPreferencesStore.toggleDownloadCoversSeperately();
+	}
+
+	function handleCrossfadeChange(event: Event): void {
+		const target = event.currentTarget as HTMLInputElement | null;
+		if (!target) {
+			return;
+		}
+		const value = Number(target.value);
+		if (!Number.isFinite(value)) {
+			return;
+		}
+		playerStore.setCrossfadeSeconds(value);
 	}
 
 	function setDownloadMode(mode: DownloadMode): void {
@@ -584,6 +601,30 @@
 													{/if}
 												</button>
 											{/each}
+										</div>
+									</section>
+									<section class="settings-section settings-section--wide">
+										<p class="section-heading">Playback</p>
+										<div class="glass-option glass-option--slider">
+											<div class="glass-option__content">
+												<span class="glass-option__label">Crossfade</span>
+												<span class="glass-option__description">
+													Blend tracks by {crossfadeLabel()} (skips Hi-Res/DASH).
+												</span>
+											</div>
+											<div class="crossfade-controls">
+												<input
+													type="range"
+													min="0"
+													max="12"
+													step="1"
+													value={$playerStore.crossfadeSeconds}
+													oninput={handleCrossfadeChange}
+													class="crossfade-slider"
+													aria-label="Crossfade duration"
+												/>
+												<span class="crossfade-value">{crossfadeLabel()}</span>
+											</div>
 										</div>
 									</section>
 									<section class="settings-section settings-section--wide">
@@ -1304,6 +1345,10 @@
 		transition: border-color 140ms ease, transform 140ms ease, box-shadow 160ms ease;
 	}
 
+	.glass-option--slider {
+		cursor: default;
+	}
+
 	.glass-option--compact {
 		padding: 0.45rem 0.6rem;
 		gap: 0.5rem;
@@ -1379,6 +1424,29 @@
 		border-color: rgba(239, 68, 68, 0.7);
 		color: rgba(254, 226, 226, 0.95);
 		box-shadow: inset 0 0 20px rgba(239, 68, 68, 0.18);
+	}
+
+	.crossfade-controls {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+	}
+
+	.crossfade-slider {
+		width: 140px;
+		height: 0.3rem;
+		cursor: pointer;
+		appearance: none;
+		border-radius: 999px;
+		background: rgba(148, 163, 184, 0.35);
+		accent-color: rgba(239, 68, 68, 0.9);
+	}
+
+	.crossfade-value {
+		font-size: 0.7rem;
+		letter-spacing: 0.12em;
+		text-transform: uppercase;
+		color: rgba(248, 226, 226, 0.82);
 	}
 
 	.settings-section--bordered {

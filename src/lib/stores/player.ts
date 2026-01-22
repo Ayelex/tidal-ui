@@ -15,7 +15,8 @@ const initialState: AudioState = {
 		volume: stored.volume,
 		quality: prefs.playbackQuality,
 		repeatMode: stored.repeatMode,
-		qualitySource: 'manual'
+		qualitySource: 'manual',
+		crossfadeSeconds: stored.crossfadeSeconds
 	}),
 	muted: stored.muted,
 	shuffleEnabled: stored.shuffleEnabled
@@ -62,6 +63,7 @@ if (browser) {
 			setRepeatMode: (mode: RepeatMode) => controller?.setRepeatMode(mode),
 			toggleShuffle: () => controller?.toggleShuffle(),
 			setShuffleSeed: (seed: number | null) => controller?.setShuffleSeed(seed),
+			setCrossfadeSeconds: (seconds: number) => controller?.setCrossfadeSeconds(seconds),
 			getState: () => controller?.getState()
 		};
 	}
@@ -101,6 +103,7 @@ export const playerStore = {
 	seekTo: (seconds: number) => withController((ctrl) => ctrl.seekTo(seconds, 'ui')),
 	setVolume: (volume: number) => withController((ctrl) => ctrl.setVolume(volume)),
 	setMuted: (muted: boolean) => withController((ctrl) => ctrl.setMuted(muted)),
+	setCrossfadeSeconds: (seconds: number) => withController((ctrl) => ctrl.setCrossfadeSeconds(seconds)),
 	setQuality: (quality: AudioQuality) => withController((ctrl) => ctrl.setQuality(quality, 'manual')),
 	setRepeatMode: (repeatMode: RepeatMode) => withController((ctrl) => ctrl.setRepeatMode(repeatMode)),
 	cycleRepeatMode: () => withController((ctrl) => ctrl.cycleRepeatMode()),
@@ -127,5 +130,3 @@ export const volume = derived(playerStore, ($store) => $store.volume);
 export const progress = derived(playerStore, ($store) =>
 	$store.duration > 0 ? ($store.currentTime / $store.duration) * 100 : 0
 );
-
-

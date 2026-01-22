@@ -8,13 +8,22 @@ type StoredAudioPreferences = {
 	muted: boolean;
 	repeatMode: RepeatMode;
 	shuffleEnabled: boolean;
+	crossfadeSeconds: number;
 };
 
 const DEFAULTS: StoredAudioPreferences = {
 	volume: 0.8,
 	muted: false,
 	repeatMode: 'all',
-	shuffleEnabled: false
+	shuffleEnabled: false,
+	crossfadeSeconds: 0
+};
+
+const clampCrossfade = (value: unknown): number => {
+	if (typeof value !== 'number' || !Number.isFinite(value)) {
+		return DEFAULTS.crossfadeSeconds;
+	}
+	return Math.min(12, Math.max(0, Math.round(value)));
 };
 
 export function loadAudioPreferences(): StoredAudioPreferences {
@@ -37,7 +46,8 @@ export function loadAudioPreferences(): StoredAudioPreferences {
 				parsed.repeatMode === 'off' || parsed.repeatMode === 'all' || parsed.repeatMode === 'one'
 					? parsed.repeatMode
 					: DEFAULTS.repeatMode,
-			shuffleEnabled: typeof parsed.shuffleEnabled === 'boolean' ? parsed.shuffleEnabled : DEFAULTS.shuffleEnabled
+			shuffleEnabled: typeof parsed.shuffleEnabled === 'boolean' ? parsed.shuffleEnabled : DEFAULTS.shuffleEnabled,
+			crossfadeSeconds: clampCrossfade(parsed.crossfadeSeconds)
 		};
 	} catch (error) {
 		console.warn('Failed to read audio preferences', error);
@@ -55,14 +65,16 @@ export function persistAudioPreferences(state: AudioState): void {
 		volume: Math.min(1, Math.max(0, state.volume)),
 		muted: Boolean(state.muted),
 		repeatMode: state.repeatMode,
-		shuffleEnabled: state.shuffleEnabled
+		shuffleEnabled: state.shuffleEnabled,
+		crossfadeSeconds: clampCrossfade(state.crossfadeSeconds)
 	};
 	if (
 		lastSaved &&
 		lastSaved.volume === next.volume &&
 		lastSaved.muted === next.muted &&
 		lastSaved.repeatMode === next.repeatMode &&
-		lastSaved.shuffleEnabled === next.shuffleEnabled
+		lastSaved.shuffleEnabled === next.shuffleEnabled &&
+		lastSaved.crossfadeSeconds === next.crossfadeSeconds
 	) {
 		return;
 	}

@@ -13,6 +13,7 @@ export interface AudioState {
 	currentTime: number;
 	duration: number;
 	volume: number;
+	crossfadeSeconds: number;
 	muted: boolean;
 	quality: AudioQuality;
 	qualitySource: 'auto' | 'manual';
@@ -42,6 +43,7 @@ export type AudioAction =
 	| { type: 'SET_DURATION'; duration: number }
 	| { type: 'SET_BUFFERED'; bufferedPercent: number }
 	| { type: 'SET_VOLUME'; volume: number; muted?: boolean }
+	| { type: 'SET_CROSSFADE'; seconds: number }
 	| { type: 'SET_MUTED'; muted: boolean }
 	| { type: 'SET_QUALITY'; quality: AudioQuality; source: 'auto' | 'manual' }
 	| { type: 'SET_ACTIVE_QUALITY'; activeQuality: AudioQuality | null }
@@ -57,6 +59,7 @@ export function createInitialState(params: {
 	quality: AudioQuality;
 	qualitySource?: 'auto' | 'manual';
 	repeatMode?: RepeatMode;
+	crossfadeSeconds?: number;
 }): AudioState {
 	return {
 		currentTrack: null,
@@ -68,6 +71,7 @@ export function createInitialState(params: {
 		currentTime: 0,
 		duration: 0,
 		volume: params.volume,
+		crossfadeSeconds: params.crossfadeSeconds ?? 0,
 		muted: false,
 		quality: params.quality,
 		qualitySource: params.qualitySource ?? 'manual',
@@ -132,6 +136,11 @@ export function audioReducer(state: AudioState, action: AudioAction): AudioState
 				...state,
 				volume: action.volume,
 				muted: action.muted ?? state.muted
+			};
+		case 'SET_CROSSFADE':
+			return {
+				...state,
+				crossfadeSeconds: action.seconds
 			};
 		case 'SET_MUTED':
 			return { ...state, muted: action.muted };
